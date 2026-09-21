@@ -1,3 +1,4 @@
+import warnings
 from dataclasses import dataclass
 from typing import Optional
 
@@ -46,6 +47,28 @@ class MythosConfig:
         act_threshold   -- ACT halting threshold (cumulative probability to stop looping)
         rope_theta      -- RoPE base frequency
         lora_rank       -- rank of the per-loop depth-wise LoRA adapter
+
+    ConceptNet injection (optional static knowledge channel):
+        use_concept_injection -- fuse frozen ConceptNet vectors into the model, as a
+                                 gated delta added at each site in concept_sites
+        concept_dim     -- width of those vectors (ConceptNet Numberbatch is 300)
+        concept_max_span-- longest token-id span matched against the concept
+                           vocabulary; 1 is unigram-only, higher values also
+                           match a term split across several tokens ("ma|chine")
+                           or a multi-word phrase. A matched span is delivered
+                           only at its LAST token, which keeps the channel
+                           causal; earlier positions never receive it, and
+                           later ones can read it only through "cross"
+        concept_sites   -- non-empty subset of ("embed", "e", "attn"): the token
+                           embedding before the Prelude, the encoded input e the
+                           recurrent block re-injects every loop iteration, and
+                           the recurrent block's attention input each iteration
+        concept_combiner-- how a position's candidates become one vector:
+                           "mean" (learned per-slot weights, content-independent),
+                           "attend" (a query from the site's hidden state picks
+                           among that position's candidates) or "cross" (causal
+                           cross-attention over concepts completed so far)
+        concept_attn_dim-- query/key width for the "attend" and "cross" combiners
     """
 
     vocab_size: int = 32000
@@ -79,6 +102,20 @@ class MythosConfig:
     max_output_tokens: int = 4096
     # Dropout (set 0.0 to disable; 0.1 is standard for pretraining)
     dropout: float = 0.0
+    # ConceptNet Numberbatch injection (off by default; see scripts/)
+    use_concept_injection: bool = False
+    concept_dim: int = 300
+    # Longest token-id span matched against the concept vocabulary.
+    # 1 = unigram lookup only; higher values match subword-split words and
+    # multi-word phrases, delivering each span's vector at its last token only
+    # (keeps the channel causal).
+    concept_max_span: int = 1
+    # Where the concept delta enters: any subset of ("embed", "e", "attn").
+    concept_sites: tuple = ("e",)
+    # How a position's candidates are combined: "mean" | "attend" | "cross".
+    concept_combiner: str = "mean"
+    # Width of the query/key space for the attention combiners.
+    concept_attn_dim: int = 64
 
 
 # ---------------------------------------------------------------------------
@@ -657,20 +694,27 @@ class TransformerBlock(nn.Module):
         mask: Optional[torch.Tensor] = None,
         kv_cache: Optional[dict] = None,
         cache_key: str = "default",
+        attn_delta: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
-            x         -- input of shape (B, T, dim)
-            freqs_cis -- precomputed RoPE frequencies
-            mask      -- additive causal mask or None
-            kv_cache  -- cache dict mutated in-place by the attention layer
-            cache_key -- key identifying this layer in the cache
+            x          -- input of shape (B, T, dim)
+            freqs_cis  -- precomputed RoPE frequencies
+            mask       -- additive causal mask or None
+            kv_cache   -- cache dict mutated in-place by the attention layer
+            cache_key  -- key identifying this layer in the cache
+            attn_delta -- optional (B, T, dim) added to the attention input
+                          only; the feed-forward path and the residual stream
+                          never see it. Used by the "attn" concept site.
 
         Returns:
             Output tensor of shape (B, T, dim)
         """
+        attn_in = self.attn_norm(x)
+        if attn_delta is not None:
+            attn_in = attn_in + attn_delta
         x = x + self.resid_drop(
-            self.attn(self.attn_norm(x), freqs_cis, mask, kv_cache, cache_key)
+            self.attn(attn_in, freqs_cis, mask, kv_cache, cache_key)
         )
         x = x + self.resid_drop(self.ffn(self.ffn_norm(x)))
         return x
@@ -830,6 +874,7 @@ class RecurrentBlock(nn.Module):
         mask: Optional[torch.Tensor] = None,
         n_loops: Optional[int] = None,
         kv_cache: Optional[dict] = None,
+        attn_delta_fn=None,
     ) -> torch.Tensor:
         """
         Run the recurrent loop for up to n_loops iterations with ACT early exit.
@@ -843,6 +888,13 @@ class RecurrentBlock(nn.Module):
                         Can be increased at inference for deeper reasoning (depth extrapolation).
             kv_cache -- cache dict passed through to the inner TransformerBlock;
                         each loop iteration uses a separate cache key
+            attn_delta_fn -- optional callable mapping the block input (B, T, dim)
+                        to a delta added to the attention input each iteration.
+                        Used by the "attn" concept site; the query changes with
+                        depth, so an attention combiner can select differently
+                        at each iteration. With the "mean" combiner the delta
+                        is query-independent and the callable returns the same
+                        precomputed tensor every iteration.
 
         Returns:
             ACT-weighted sum of hidden states across iterations, shape (B, T, dim)
@@ -858,7 +910,10 @@ class RecurrentBlock(nn.Module):
             h_loop = loop_index_embedding(h, t, self.loop_dim)
             combined = self.norm(h_loop + e)
             cache_key = f"recurrent_loop_{t}"
-            trans_out = self.block(combined, freqs_cis, mask, kv_cache, cache_key)
+            attn_delta = attn_delta_fn(combined) if attn_delta_fn is not None else None
+            trans_out = self.block(
+                combined, freqs_cis, mask, kv_cache, cache_key, attn_delta=attn_delta
+            )
             trans_out = trans_out + self.lora(trans_out, t)
             h = self.injection(h, e, trans_out)
 
@@ -889,6 +944,430 @@ class RecurrentBlock(nn.Module):
                 break
 
         return h_out
+
+
+# ---------------------------------------------------------------------------
+# ConceptNet fusion (frozen lexical knowledge, fused at configurable sites)
+# ---------------------------------------------------------------------------
+
+# Two independent polynomial hashes, each modulo a prime below 2^31 so the
+# multiply stays inside int64. Combined they give a ~62-bit key, which keeps
+# accidental collisions negligible; every candidate is verified against the
+# stored n-gram anyway, so a collision costs a missed match, never a wrong one.
+_HASH_MODS = (2147483647, 2147483629)
+_HASH_BASES = (1000003, 1000033)
+
+
+def ngram_keys(x: torch.Tensor) -> torch.Tensor:
+    """
+    Hash the last dimension of an integer tensor into a single int64 key.
+
+    Used to look up token-id n-grams in a sorted table with `searchsorted`,
+    which needs one scalar per entry. ConceptFusion.load calls it at load time,
+    to turn the raw token-id n-grams stored by scripts/build_concept_table.py
+    into sorted keys, and candidates() calls it at match time to key the input
+    windows, so the two can never disagree about the encoding. The build script
+    stores raw id tuples and never hashes, so keys are never saved to disk and
+    the hash can change without rebuilding tables.
+
+    Args:
+        x -- integer tensor of shape (..., n)
+
+    Returns:
+        int64 tensor of shape (...)
+    """
+    x = x.to(torch.int64)
+    parts = []
+    for base, mod in zip(_HASH_BASES, _HASH_MODS):
+        h = torch.zeros(x.shape[:-1], dtype=torch.int64, device=x.device)
+        for k in range(x.shape[-1]):
+            h = (h * base + x[..., k]) % mod
+        parts.append(h)
+    return parts[0] * _HASH_MODS[1] + parts[1]
+
+
+CONCEPT_SITES = ("embed", "e", "attn")
+CONCEPT_COMBINERS = ("mean", "attend", "cross")
+
+
+class ConceptFusion(nn.Module):
+    """
+    Frozen ConceptNet lookup, fused into the model at one or more sites.
+
+    Lookup produces, per position, a small set of *candidate* vectors:
+
+    - slot 0    the unigram entry for the token at that position
+    - slot n-1  the span of length n that ENDS at that position
+
+    Assigning a span to its last token is what keeps the channel causal. Under
+    next-token training, position i predicts token i+1; if the span [i, i+1]
+    delivered its vector at i, the model would be handed the identity of its
+    own target. The last token is the first position at which the span is
+    fully observed. Earlier fragments never receive it; every later position
+    can, through the causal cross-attention memory.
+
+    Combiners (cfg.concept_combiner) turn candidates into one vector:
+
+    - "mean"    applies a learned weight per slot, then divides by the number
+                of valid slots (not by the sum of the weights).
+                Content-independent.
+    - "attend"  a query from the site's hidden state selects among that
+                position's own candidates.
+    - "cross"   causal cross-attention over the sequence's concept memory,
+                so a token can read concepts that completed earlier.
+
+    Sites (cfg.concept_sites) are where the result enters the network:
+
+    - "embed"   added to the token embedding, before the Prelude
+    - "e"       added to the frozen encoding, re-injected every loop iteration
+    - "attn"    added to the recurrent block's attention input, each iteration
+
+    Each site has its own zero-init gate and, for attention combiners, its own
+    query projection, since the three hand over representations at different
+    scales. Everything is bias-free and SiLU maps zero to zero, so an
+    uncovered position contributes exactly nothing, and a zero gate makes the
+    model identical to one with fusion switched off.
+    """
+
+    def __init__(self, cfg: MythosConfig):
+        """
+        Args:
+            cfg -- MythosConfig; uses vocab_size, dim, concept_dim,
+                   concept_max_span, concept_sites, concept_combiner,
+                   concept_attn_dim
+        """
+        super().__init__()
+        self.concept_dim = cfg.concept_dim
+        self.max_span = max(1, getattr(cfg, "concept_max_span", 1))
+        self.sites = tuple(getattr(cfg, "concept_sites", ("e",)))
+        self.combiner = getattr(cfg, "concept_combiner", "mean")
+        attn_dim = getattr(cfg, "concept_attn_dim", 64)
+
+        unknown = [s for s in self.sites if s not in CONCEPT_SITES]
+        if unknown or not self.sites:
+            raise ValueError(
+                f"concept_sites must be a non-empty subset of {CONCEPT_SITES}, got {self.sites!r}"
+            )
+        if self.combiner not in CONCEPT_COMBINERS:
+            raise ValueError(
+                f"concept_combiner must be one of {CONCEPT_COMBINERS}, got {self.combiner!r}"
+            )
+
+        # Every lookup structure is a NON-persistent buffer, so checkpoints stay
+        # small (no hundreds of MB of table) and independent of which table is
+        # loaded. The span_* shapes are only known after load(), so persistent
+        # buffers would also size-mismatch under strict load_state_dict even
+        # when resuming a checkpoint saved with the same config. The trade is
+        # that they must be re-loaded after construction on every run and
+        # every rank. Note that enabling the channel adds concept.* Parameters,
+        # so resuming a checkpoint saved without it needs the model's
+        # load_state_dict(strict=False) and a fresh optimizer state.
+        self.register_buffer(
+            "concept_table",
+            torch.zeros(cfg.vocab_size, cfg.concept_dim, dtype=torch.float16),
+            persistent=False,
+        )
+        self.register_buffer(
+            "span_vectors",
+            torch.zeros(0, cfg.concept_dim, dtype=torch.float16),
+            persistent=False,
+        )
+        # Shapes are unknown until a table is loaded; buffers are re-assigned
+        # in load(), which nn.Module permits for names already registered.
+        for n in range(2, self.max_span + 1):
+            self.register_buffer(f"span_key_{n}", torch.zeros(0, dtype=torch.int64), persistent=False)
+            self.register_buffer(f"span_gram_{n}", torch.zeros(0, n, dtype=torch.int64), persistent=False)
+            self.register_buffer(f"span_row_{n}", torch.zeros(0, dtype=torch.int64), persistent=False)
+
+        # Slot weights for the mean combiner and the memory rows. Raw
+        # Parameters, so _init_weights on the parent cannot clobber them.
+        self.span_weight = nn.Parameter(torch.ones(self.max_span))
+        # One zero-init gate per site, also raw Parameters.
+        self.gates = nn.ParameterDict(
+            {s: nn.Parameter(torch.zeros(cfg.dim)) for s in self.sites}
+        )
+
+        # Shared intermediate projection into model width. No biases.
+        self.proj = nn.Sequential(
+            nn.Linear(cfg.concept_dim, cfg.concept_dim, bias=False),
+            nn.SiLU(),
+            nn.Linear(cfg.concept_dim, cfg.dim, bias=False),
+        )
+
+        if self.combiner in ("attend", "cross"):
+            self.queries = nn.ModuleDict(
+                {s: nn.Linear(cfg.dim, attn_dim, bias=False) for s in self.sites}
+            )
+            self.key = nn.Linear(cfg.concept_dim, attn_dim, bias=False)
+            self.attn_scale = attn_dim ** -0.5
+        if self.combiner == "cross":
+            self.value = nn.Linear(cfg.concept_dim, cfg.concept_dim, bias=False)
+
+        # Plain attribute, not a buffer: it never enters state_dict, so it resets
+        # on every construction and checkpoint resume, just like the tables.
+        self.loaded = False
+
+    # -- loading ---------------------------------------------------------
+
+    def load(self, source, tokenizer_id: Optional[str] = None) -> dict:
+        """
+        Populate the lookup tables from a build artifact, a dict, or a tensor.
+
+        Every re-assigned buffer is built on the device concept_table already
+        lives on, so loading after model.to(device) works without another move.
+
+        Args:
+            source       -- path to the .pt written by scripts/build_concept_table.py,
+                            an equivalent dict, or a (vocab_size, concept_dim) tensor
+                            for the unigram path only
+            tokenizer_id -- optional tokenizer name the model was trained with;
+                            checked against the payload's "tokenizer_id" when
+                            both are present
+
+        Returns:
+            Summary dict with covered unigram rows, span entries per length, and
+            "dropped_span_lengths" (sorted span lengths present in the payload
+            but above concept_max_span, so ignored; empty if none).
+
+        Raises:
+            RuntimeError -- on a tokenizer_id or vocab_size mismatch, or a shape
+                            mismatch against the model config.
+        """
+        if isinstance(source, torch.Tensor):
+            payload = {"table": source}
+        elif isinstance(source, dict):
+            payload = source
+        else:
+            loaded = torch.load(source, map_location="cpu")
+            payload = loaded if isinstance(loaded, dict) else {"table": loaded}
+
+        n_rows = self.concept_table.shape[0]
+        built_for = payload.get("tokenizer_id")
+        if tokenizer_id is not None and built_for is not None and tokenizer_id != built_for:
+            raise RuntimeError(
+                f"Concept table was built for tokenizer {built_for!r}, but "
+                f"tokenizer_id={tokenizer_id!r} was given. Rebuild it against this tokenizer."
+            )
+        built_vocab = payload.get("vocab_size")
+        if built_vocab is not None and int(built_vocab) != n_rows:
+            raise RuntimeError(
+                f"Concept table was built for vocab_size={int(built_vocab)}, but the "
+                f"model has {n_rows} rows. Rebuild it against this tokenizer and vocab_size."
+            )
+
+        table = payload["table"]
+        expected = (n_rows, self.concept_dim)
+        if tuple(table.shape) != expected:
+            raise RuntimeError(
+                f"Concept table shape {tuple(table.shape)} does not match {expected}. "
+                "Rebuild it against this tokenizer and vocab_size."
+            )
+        dev = self.concept_table.device
+        self.concept_table.copy_(table.to(device=dev, dtype=self.concept_table.dtype))
+
+        summary = {
+            "unigram_rows": int((self.concept_table != 0).any(dim=-1).sum()),
+            "spans": {},
+            "dropped_span_lengths": [],
+        }
+
+        spans = payload.get("spans") or {}
+        vectors = payload.get("span_vectors")
+        if spans and vectors is not None:
+            if vectors.shape[1] != self.concept_dim:
+                raise RuntimeError(
+                    f"Span vectors are {vectors.shape[1]}-dim, expected {self.concept_dim}."
+                )
+            self.span_vectors = vectors.to(device=dev, dtype=self.span_vectors.dtype)
+            dropped = []
+            for n_str, entry in spans.items():
+                n = int(n_str)
+                if n > self.max_span:
+                    dropped.append(n)  # built deeper than this model is configured for
+                    continue
+                grams = entry["grams"].to(device=dev, dtype=torch.int64)
+                rows = entry["rows"].to(device=dev, dtype=torch.int64)
+                keys = ngram_keys(grams)
+                order = torch.argsort(keys)
+                setattr(self, f"span_key_{n}", keys[order].contiguous())
+                setattr(self, f"span_gram_{n}", grams[order].contiguous())
+                setattr(self, f"span_row_{n}", rows[order].contiguous())
+                summary["spans"][n] = int(grams.shape[0])
+            if dropped:
+                dropped = sorted(dropped)
+                summary["dropped_span_lengths"] = dropped
+                warnings.warn(
+                    f"Concept table has spans of length {dropped} but "
+                    f"concept_max_span={self.max_span}, so they are ignored. "
+                    f"Set concept_max_span={max(dropped)} to use them.",
+                    stacklevel=2,
+                )
+
+        self.loaded = True
+        return summary
+
+    # -- lookup ----------------------------------------------------------
+
+    def candidates(
+        self, input_ids: torch.Tensor, context_ids: Optional[torch.Tensor] = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Gather every concept vector that is causally available at each position.
+
+        Args:
+            input_ids   -- (B, T) tokens whose positions need candidates
+            context_ids -- (B, L) the full sequence so far, when `input_ids` is
+                           only its tail. A span ending at the current decode
+                           position still needs the previous max_span-1 tokens.
+
+        Returns:
+            cand  -- (B, T, K, concept_dim) float32, K = max_span
+            valid -- (B, T, K) bool; slot 0 is the unigram, slot n-1 is the
+                     length-n span ending at that position
+        """
+        B, T = input_ids.shape
+        ctx = input_ids if context_ids is None else context_ids
+        # Only windows that end inside the last T positions can matter, so
+        # decode steps never rescan the whole generated sequence.
+        keep = T + self.max_span - 1
+        if ctx.shape[1] > keep:
+            ctx = ctx[:, -keep:]
+        L = ctx.shape[1]
+        K, D = self.max_span, self.concept_dim
+
+        cand = torch.zeros(B, L, K, D, device=ctx.device, dtype=torch.float32)
+        valid = torch.zeros(B, L, K, device=ctx.device, dtype=torch.bool)
+
+        uni = self.concept_table[ctx].float()
+        cand[:, :, 0] = uni
+        valid[:, :, 0] = (uni != 0).any(-1)
+
+        for n in range(2, self.max_span + 1):
+            keys = getattr(self, f"span_key_{n}")
+            if keys.numel() == 0 or L < n:
+                continue
+            grams = getattr(self, f"span_gram_{n}")
+            rows = getattr(self, f"span_row_{n}")
+
+            win = ctx.unfold(1, n, 1)  # (B, L-n+1, n)
+            n_windows = win.shape[1]
+            flat = win.reshape(-1, n)
+            probe = ngram_keys(flat)
+
+            pos = torch.searchsorted(keys, probe).clamp(max=keys.numel() - 1)
+            hit = keys[pos] == probe
+            hit = hit & (grams[pos] == flat).all(-1)
+            if not bool(hit.any()):
+                continue
+
+            sel = hit.nonzero(as_tuple=True)[0]
+            vecs = self.span_vectors[rows[pos[sel]]].float()
+            batch_idx = torch.div(sel, n_windows, rounding_mode="floor")
+            end_idx = sel % n_windows + (n - 1)
+            # At most one length-n window ends at any position, so this is a
+            # plain write, never an accumulate.
+            cand[batch_idx, end_idx, n - 1] = vecs
+            valid[batch_idx, end_idx, n - 1] = True
+
+        return cand[:, -T:], valid[:, -T:]
+
+    def merge_mean(self, cand: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        """
+        Masked mean of per-slot-scaled candidates; zero where none are valid.
+
+        Applies a learned weight per slot, then divides by the number of valid
+        slots (not by the sum of the weights).
+
+        Args:
+            cand  -- (B, T, K, concept_dim)
+            valid -- (B, T, K)
+
+        Returns:
+            (B, T, concept_dim) float32
+        """
+        w = self.span_weight.float().view(1, 1, -1, 1) * valid.unsqueeze(-1).float()
+        acc = (w * cand).sum(2)
+        cnt = valid.float().sum(-1, keepdim=True)
+        return acc / cnt.clamp(min=1.0)
+
+    # -- combining -------------------------------------------------------
+
+    def delta(
+        self,
+        site: str,
+        query: Optional[torch.Tensor],
+        cand: torch.Tensor,
+        valid: torch.Tensor,
+        memory: Optional[torch.Tensor] = None,
+        mem_valid: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Combine candidates for one site and return the gated delta.
+
+        Args:
+            site      -- one of the configured sites
+            query     -- (B, T, dim) hidden state at the site; unused by "mean"
+            cand      -- (B, T, K, concept_dim) from candidates()
+            valid     -- (B, T, K)
+            memory    -- (B, L, concept_dim) concept memory, "cross" only; the
+                         T query positions are the LAST T of the L memory rows
+            mem_valid -- (B, L) which memory rows hold a vector
+
+        Returns:
+            (B, T, dim) delta, already scaled by the site's gate
+        """
+        if self.combiner == "mean":
+            feat = self.merge_mean(cand, valid)
+
+        elif self.combiner == "attend":
+            q = self.queries[site](query)  # (B, T, a)
+            k = self.key(cand.to(q.dtype))  # (B, T, K, a)
+            scores = (k * q.unsqueeze(2)).sum(-1) * self.attn_scale  # (B, T, K)
+            scores = scores.masked_fill(~valid, torch.finfo(scores.dtype).min)
+            alpha = F.softmax(scores, dim=-1) * valid.any(-1, keepdim=True).to(scores.dtype)
+            feat = (alpha.unsqueeze(-1) * cand.to(alpha.dtype)).sum(2)
+
+        else:  # "cross"
+            B, T = query.shape[:2]
+            L = memory.shape[1]
+            q = self.queries[site](query)  # (B, T, a)
+            k = self.key(memory.to(q.dtype))  # (B, L, a)
+            v = self.value(memory.to(q.dtype))  # (B, L, concept_dim)
+            scores = torch.matmul(q, k.transpose(1, 2)) * self.attn_scale  # (B, T, L)
+            # Query i sits at absolute position L-T+i and may read memory rows
+            # at or before it. Reading later rows would leak future tokens.
+            q_pos = torch.arange(T, device=query.device) + (L - T)
+            m_pos = torch.arange(L, device=query.device)
+            allowed = (m_pos[None, :] <= q_pos[:, None])[None] & mem_valid[:, None, :]
+            scores = scores.masked_fill(~allowed, torch.finfo(scores.dtype).min)
+            alpha = F.softmax(scores, dim=-1) * allowed.any(-1, keepdim=True).to(scores.dtype)
+            feat = torch.matmul(alpha, v)
+
+        out = self.proj(feat.to(self.proj[0].weight.dtype))
+        return self.gates[site] * out
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        context_ids: Optional[torch.Tensor] = None,
+        site: Optional[str] = None,
+        query: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Convenience: candidates then delta for one site, no memory cache.
+
+        Sufficient for the "mean" combiner and for inspecting coverage. The
+        full model drives candidates() and delta() directly so the cross
+        memory can span the whole sequence and be cached across decode steps.
+        """
+        site = site or self.sites[0]
+        cand, valid = self.candidates(input_ids, context_ids)
+        if self.combiner != "mean" and query is None:
+            raise ValueError(f"combiner {self.combiner!r} needs a query tensor")
+        memory = mem_valid = None
+        if self.combiner == "cross":
+            memory, mem_valid = self.merge_mean(cand, valid), valid.any(-1)
+        return self.delta(site, query, cand, valid, memory, mem_valid)
 
 
 # ---------------------------------------------------------------------------
@@ -951,6 +1430,12 @@ class OpenMythos(nn.Module):
             [TransformerBlock(cfg, use_moe=False) for _ in range(cfg.coda_layers)]
         )
 
+        # Optional ConceptNet channel. getattr guards configs unpickled from
+        # checkpoints written before these fields existed.
+        self.use_concept = getattr(cfg, "use_concept_injection", False)
+        if self.use_concept:
+            self.concept = ConceptFusion(cfg)
+
         self.norm = RMSNorm(cfg.dim)
         self.head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
         self.head.weight = self.embed.weight  # weight tying
@@ -989,12 +1474,71 @@ class OpenMythos(nn.Module):
         )
         return torch.triu(mask, diagonal=1)
 
+    def _concept_context(
+        self,
+        input_ids: torch.Tensor,
+        context_ids: Optional[torch.Tensor],
+        kv_cache: Optional[dict],
+    ) -> dict:
+        """
+        Gather candidates once per forward, plus the cross-attention memory.
+
+        The memory only ever grows by the new positions, so during decoding it
+        is kept in the same kv_cache dict the attention layers use, under the
+        key "concept_memory", and extended rather than rebuilt each step.
+        """
+        cand, valid = self.concept.candidates(input_ids, context_ids)
+        ctx = {"cand": cand, "valid": valid, "memory": None, "mem_valid": None}
+        if self.concept.combiner == "cross":
+            new_mem = self.concept.merge_mean(cand, valid)
+            new_valid = valid.any(-1)
+            if kv_cache is not None and "concept_memory" in kv_cache:
+                prev = kv_cache["concept_memory"]
+                new_mem = torch.cat([prev["m"], new_mem], dim=1)
+                new_valid = torch.cat([prev["v"], new_valid], dim=1)
+            if kv_cache is not None:
+                kv_cache["concept_memory"] = {"m": new_mem.detach(), "v": new_valid}
+            ctx["memory"], ctx["mem_valid"] = new_mem, new_valid
+        return ctx
+
+    def load_concept_table(self, source, tokenizer_id: Optional[str] = None) -> dict:
+        """
+        Populate the frozen ConceptNet lookup tables.
+
+        Every lookup structure is a non-persistent buffer, so none of them
+        appear in state_dict and all must be loaded after construction on
+        every run and on every distributed rank.
+
+        Args:
+            source -- path to the .pt file written by
+                      scripts/build_concept_table.py, or a tensor of shape
+                      (vocab_size, concept_dim) for the unigram path only
+            tokenizer_id -- optional tokenizer name; raises if the payload
+                      records a different "tokenizer_id"
+
+        Returns:
+            Summary dict with covered unigram rows, span counts per length, and
+            the sorted span lengths dropped because they exceed concept_max_span.
+
+        Raises:
+            RuntimeError -- if concept injection is disabled on this model, or
+                            the table's tokenizer_id, vocab_size or shape does
+                            not match.
+        """
+        if not self.use_concept:
+            raise RuntimeError(
+                "Concept injection is disabled. Set use_concept_injection=True "
+                "in MythosConfig before constructing the model."
+            )
+        return self.concept.load(source, tokenizer_id=tokenizer_id)
+
     def forward(
         self,
         input_ids: torch.Tensor,
         n_loops: Optional[int] = None,
         kv_cache: Optional[dict] = None,
         start_pos: int = 0,
+        context_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Forward pass through Prelude → Recurrent Block → Coda.
@@ -1009,6 +1553,10 @@ class OpenMythos(nn.Module):
                          sequence; used to select the correct RoPE frequencies
                          during incremental decoding (0 for prefill, prompt_len
                          for each subsequent decode step)
+            context_ids -- full sequence so far, when input_ids is only its
+                         tail. Used solely for ConceptNet span matching, since
+                         a multi-token term can start before the current decode
+                         step. Ignored when concept injection is off.
 
         Returns:
             Logits of shape (B, T, vocab_size)
@@ -1022,11 +1570,43 @@ class OpenMythos(nn.Module):
         )[start_pos : start_pos + T]
         mask = self._causal_mask(T, device, x.dtype) if T > 1 else None
 
+        # Concept candidates are gathered once and shared by every site. The
+        # gates start at zero, so all of this is a no-op until training moves
+        # them. Casts are explicit because FSDP casts buffers to the
+        # mixed-precision dtype while the single-GPU path leaves them fp16.
+        concept = None
+        if self.use_concept:
+            if not self.concept.loaded:
+                raise RuntimeError(
+                    "Concept injection is enabled but no concept table is loaded. "
+                    "Call model.load_concept_table(...) after construction and after "
+                    "loading any checkpoint, on every rank."
+                )
+            concept = self._concept_context(input_ids, context_ids, kv_cache)
+            if "embed" in self.concept.sites:
+                x = x + self.concept.delta("embed", x, **concept).to(x.dtype)
+
         for i, layer in enumerate(self.prelude):
             x = layer(x, freqs_cis, mask, kv_cache, cache_key=f"prelude_{i}")
 
         e = x  # encoded input frozen for injection every loop
-        x = self.recurrent(x, e, freqs_cis, mask, n_loops, kv_cache)
+        attn_delta_fn = None
+        if concept is not None:
+            if "e" in self.concept.sites:
+                e = e + self.concept.delta("e", e, **concept).to(x.dtype)
+            if "attn" in self.concept.sites:
+                if self.concept.combiner == "mean":
+                    # The mean delta ignores the query, so compute it once and
+                    # reuse it every iteration; autograd sums the gradients.
+                    attn_delta = self.concept.delta("attn", None, **concept).to(x.dtype)
+                    attn_delta_fn = lambda combined: attn_delta  # noqa: E731
+                else:
+                    attn_delta_fn = lambda combined: self.concept.delta(  # noqa: E731
+                        "attn", combined, **concept
+                    ).to(combined.dtype)
+        x = self.recurrent(
+            x, e, freqs_cis, mask, n_loops, kv_cache, attn_delta_fn=attn_delta_fn
+        )
 
         for i, layer in enumerate(self.coda):
             x = layer(x, freqs_cis, mask, kv_cache, cache_key=f"coda_{i}")
@@ -1073,7 +1653,13 @@ class OpenMythos(nn.Module):
                 cur_ids = input_ids[:, -1:]
                 start_pos = prompt_len + step - 1
             logits = self.forward(
-                cur_ids, n_loops=n_loops, kv_cache=kv_cache, start_pos=start_pos
+                cur_ids,
+                n_loops=n_loops,
+                kv_cache=kv_cache,
+                start_pos=start_pos,
+                # Pass the running sequence so a concept span that began in
+                # earlier tokens can still cover the token being decoded.
+                context_ids=input_ids,
             )
             logits = logits[:, -1, :] / temperature
             if top_k > 0:

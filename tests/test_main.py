@@ -1,7 +1,12 @@
+import inspect
+import warnings
+
 import torch
 import pytest
+import open_mythos.main as main_module
 from open_mythos.main import (
     ACTHalting,
+    ConceptFusion,
     Expert,
     GQAttention,
     LTIInjection,
@@ -672,6 +677,934 @@ class TestAttnTypeSwap:
             )
 
         assert cache_bytes(cache_mla) < cache_bytes(cache_gqa)
+
+
+# ---------------------------------------------------------------------------
+# ConceptNet injection
+# ---------------------------------------------------------------------------
+
+CONCEPT_DIM = 16
+
+# Devices the load-placement test runs on: CPU always, accelerators when present.
+CONCEPT_DEVICES = [
+    "cpu",
+    pytest.param(
+        "cuda",
+        marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA"),
+    ),
+    pytest.param(
+        "mps",
+        marks=pytest.mark.skipif(
+            not torch.backends.mps.is_available(), reason="needs MPS"
+        ),
+    ),
+]
+
+
+def concept_cfg(**overrides) -> MythosConfig:
+    overrides.setdefault("use_concept_injection", True)
+    overrides.setdefault("concept_dim", CONCEPT_DIM)
+    return gqa_cfg(**overrides)
+
+
+def open_gates(model):
+    """Move every site gate off its zero init so the channel is observable."""
+    for g in model.concept.gates.values():
+        torch.nn.init.ones_(g)
+    return model
+
+
+def span_payload(vocab_size, entries=()):
+    """
+    Build a loadable payload from (id_tuple, fill_value) pairs.
+
+    Each entry becomes one span vector row filled with its value, indexed under
+    its own length.
+    """
+    grouped, vectors = {}, []
+    for gram, fill in entries:
+        row = len(vectors)
+        vectors.append(torch.full((CONCEPT_DIM,), float(fill)))
+        grams, rows = grouped.setdefault(str(len(gram)), ([], []))
+        grams.append(list(gram))
+        rows.append(row)
+    return {
+        "table": torch.zeros(vocab_size, CONCEPT_DIM),
+        "spans": {
+            k: {
+                "grams": torch.tensor(g, dtype=torch.int32),
+                "rows": torch.tensor(r, dtype=torch.int32),
+            }
+            for k, (g, r) in grouped.items()
+        },
+        "span_vectors": (
+            torch.stack(vectors) if vectors else torch.zeros(0, CONCEPT_DIM)
+        ),
+    }
+
+
+def concept_model(entries=(), payload=None, **overrides):
+    cfg = concept_cfg(**overrides)
+    torch.manual_seed(0)
+    model = OpenMythos(cfg).eval()
+    if payload is None:
+        payload = span_payload(cfg.vocab_size, entries)
+    model.load_concept_table(payload)
+    return open_gates(model)
+
+
+class TestConceptInjection:
+    """
+    The concept vector is fused into one or more sites, all of which start
+    behind a zero gate. Tables are built in-process — these must never touch
+    the network.
+    """
+
+    @staticmethod
+    def _model_and_ids(table=None):
+        torch.manual_seed(0)
+        cfg = concept_cfg()
+        model = OpenMythos(cfg)
+        model.eval()
+        if table is None:
+            table = torch.randn(cfg.vocab_size, CONCEPT_DIM)
+        model.load_concept_table(table)
+        ids = torch.randint(0, cfg.vocab_size, (B, T))
+        return model, ids
+
+    def test_disabled_by_default(self):
+        model = OpenMythos(gqa_cfg())
+        assert model.use_concept is False
+        assert not hasattr(model, "concept")
+
+    def test_gate_starts_at_zero(self):
+        # Raw Parameters, so _init_weights must not have touched them.
+        model, _ = self._model_and_ids()
+        for g in model.concept.gates.values():
+            assert torch.count_nonzero(g) == 0
+
+    def test_zero_gate_is_identical_to_baseline(self):
+        # With the gate at its zero init the fused term vanishes, so the same
+        # weights must produce bit-identical logits with the path switched off.
+        model, ids = self._model_and_ids()
+        with torch.no_grad():
+            on = model(ids, n_loops=2)
+            model.use_concept = False
+            off = model(ids, n_loops=2)
+            model.use_concept = True
+        assert torch.equal(on, off)
+
+    def test_nonzero_gate_changes_logits(self):
+        model, ids = self._model_and_ids()
+        with torch.no_grad():
+            model.use_concept = False
+            baseline = model(ids, n_loops=2)
+            model.use_concept = True
+            open_gates(model)
+            fused = model(ids, n_loops=2)
+        assert not torch.equal(baseline, fused)
+
+    def test_zero_rows_contribute_nothing(self):
+        # Uncovered tokens are all-zero rows. Nothing in the path adds a bias
+        # and SiLU maps zero to zero, so they must contribute exactly zero.
+        cfg = concept_cfg()
+        model, ids = self._model_and_ids(
+            table=torch.zeros(cfg.vocab_size, CONCEPT_DIM)
+        )
+        with torch.no_grad():
+            open_gates(model)
+            fused = model(ids, n_loops=2)
+            model.use_concept = False
+            baseline = model(ids, n_loops=2)
+        assert torch.equal(fused, baseline)
+
+    def test_load_reports_covered_rows(self):
+        cfg = concept_cfg()
+        table = torch.zeros(cfg.vocab_size, CONCEPT_DIM)
+        table[3] = 1.0
+        table[7] = -2.0
+        torch.manual_seed(0)
+        model = OpenMythos(cfg)
+        assert model.load_concept_table(table)["unigram_rows"] == 2
+
+    def test_wrong_shape_rejected(self):
+        cfg = concept_cfg()
+        model = OpenMythos(cfg)
+        with pytest.raises(RuntimeError):
+            model.load_concept_table(torch.randn(cfg.vocab_size, CONCEPT_DIM + 1))
+        with pytest.raises(RuntimeError):
+            model.load_concept_table(torch.randn(cfg.vocab_size - 1, CONCEPT_DIM))
+
+    def test_load_on_disabled_model_raises(self):
+        model = OpenMythos(gqa_cfg())
+        with pytest.raises(RuntimeError):
+            model.load_concept_table(torch.randn(200, CONCEPT_DIM))
+
+    def test_forward_without_a_loaded_table_raises(self):
+        # The tables are all zero until load(), which would leave the channel
+        # silently dead (every concept gradient exactly zero). Forward and
+        # generate refuse to run instead.
+        cfg = concept_cfg()
+        model = OpenMythos(cfg).eval()
+        assert model.concept.loaded is False
+        ids = torch.randint(0, cfg.vocab_size, (B, T))
+        with pytest.raises(RuntimeError, match="no concept table is loaded"):
+            model(ids, n_loops=2)
+        with pytest.raises(RuntimeError, match="no concept table is loaded"):
+            model.generate(ids, max_new_tokens=1, n_loops=2)
+
+    def test_restored_checkpoint_still_needs_a_load(self):
+        # The loaded flag is not state: a model restored from a checkpoint
+        # carries trained gates but empty tables until load() runs again.
+        trained, ids = self._model_and_ids()
+        open_gates(trained)
+        restored = OpenMythos(trained.cfg).eval()
+        restored.load_state_dict(trained.state_dict())
+        with torch.no_grad():
+            with pytest.raises(RuntimeError, match="no concept table is loaded"):
+                restored(ids, n_loops=2)
+            restored.load_concept_table(torch.randn(trained.cfg.vocab_size, CONCEPT_DIM))
+            assert restored(ids, n_loops=2).shape == (B, T, trained.cfg.vocab_size)
+
+    def test_failed_load_leaves_the_model_unloaded(self):
+        cfg = concept_cfg()
+        model = OpenMythos(cfg).eval()
+        with pytest.raises(RuntimeError):
+            model.load_concept_table(torch.randn(cfg.vocab_size - 1, CONCEPT_DIM))
+        assert model.concept.loaded is False
+        model.load_concept_table(torch.randn(cfg.vocab_size, CONCEPT_DIM))
+        assert model.concept.loaded is True
+
+    def test_tokenizer_id_mismatch_rejected(self):
+        # Rows are indexed by raw token id, so a table built for another
+        # tokenizer would load and silently put vectors on unrelated tokens.
+        cfg = concept_cfg()
+        payload = span_payload(cfg.vocab_size)
+        payload["tokenizer_id"] = "gpt2"
+        model = OpenMythos(cfg)
+        with pytest.raises(RuntimeError, match="tokenizer"):
+            model.load_concept_table(payload, tokenizer_id="facebook/bart-base")
+        assert model.concept.loaded is False
+        # A matching id loads, and the check is skipped when either side is
+        # missing, so tensor and hand-built dict sources keep working.
+        model.load_concept_table(payload, tokenizer_id="gpt2")
+        model.load_concept_table(payload)
+        del payload["tokenizer_id"]
+        model.load_concept_table(payload, tokenizer_id="gpt2")
+
+    def test_payload_vocab_size_mismatch_rejected(self):
+        # The table itself has the model's row count; only the vocab_size the
+        # payload records disagrees, which means it is not what it claims.
+        cfg = concept_cfg()
+        payload = span_payload(cfg.vocab_size)
+        payload["vocab_size"] = cfg.vocab_size + 1
+        model = OpenMythos(cfg)
+        with pytest.raises(RuntimeError, match="vocab_size"):
+            model.load_concept_table(payload)
+        assert model.concept.loaded is False
+        payload["vocab_size"] = cfg.vocab_size
+        model.load_concept_table(payload)
+        assert model.concept.loaded is True
+
+    @pytest.mark.parametrize("device", CONCEPT_DEVICES)
+    def test_load_after_moving_the_model_keeps_buffers_on_its_device(self, device):
+        # concept_table is filled in place, but the span buffers are replaced,
+        # so load() has to build them where the model already lives. Loading
+        # after model.to(device) or FSDP is the natural order on every rank.
+        cfg = concept_cfg(concept_max_span=3)
+        torch.manual_seed(0)
+        model = OpenMythos(cfg).eval().to(device)
+        model.load_concept_table(
+            span_payload(cfg.vocab_size, [((10, 11), 1.0), ((11, 2, 3), 2.0)])
+        )
+        table_device = model.concept.concept_table.device
+        assert table_device.type == device
+        for name, buf in model.concept.named_buffers():
+            assert buf.device == table_device, name
+        open_gates(model)
+        ids = torch.tensor([[1, 10, 11, 2, 3]], device=device)
+        with torch.no_grad():
+            logits = model(ids, n_loops=2)
+            covered = (model.concept(ids)[0] != 0).any(-1)
+        assert torch.isfinite(logits).all()
+        assert covered.tolist() == [False, False, True, False, True]
+
+    def test_tables_stay_out_of_state_dict(self):
+        # Non-persistent buffers: checkpoints stay small and independent of the
+        # table, and the span shapes (only known after load) cannot size-mismatch
+        # a strict resume. The channel's Parameters are ordinary state, so a
+        # checkpoint saved without the channel needs strict=False to resume.
+        model, _ = self._model_and_ids()
+        keys = list(model.state_dict().keys())
+        assert not any("concept_table" in k for k in keys)
+        assert not any("span_" in k and "span_weight" not in k for k in keys)
+        assert "concept.proj.0.weight" in keys
+        assert "concept.gates.e" in keys
+        assert "concept.span_weight" in keys
+
+    def test_generate_runs_with_injection(self):
+        # Decode passes one token at a time; the lookup is derived from
+        # input_ids inside forward, so it must slice to T=1 without help.
+        model, ids = self._model_and_ids()
+        open_gates(model)
+        out = model.generate(ids, max_new_tokens=3, n_loops=2)
+        assert out.shape == (B, T + 3)
+
+    def test_mla_variant_works(self):
+        torch.manual_seed(0)
+        cfg = mla_cfg(use_concept_injection=True, concept_dim=CONCEPT_DIM)
+        model = OpenMythos(cfg)
+        model.eval()
+        model.load_concept_table(torch.randn(cfg.vocab_size, CONCEPT_DIM))
+        open_gates(model)
+        ids = torch.randint(0, cfg.vocab_size, (B, T))
+        with torch.no_grad():
+            logits = model(ids, n_loops=2)
+        assert logits.shape == (B, T, cfg.vocab_size)
+        assert torch.isfinite(logits).all()
+
+
+class TestConceptSpans:
+    """
+    Span matching. A term whose tokenization covers several tokens delivers
+    its vector at the span's LAST token — the first position where the span is
+    fully observed. Delivering it earlier would hand the model its own target.
+    """
+
+    SPAN_AB = (10, 11)       # ends at index 2 of IDS
+    SPAN_BC = (11, 2)        # ends at index 3 of IDS
+    SPAN_ABC = (10, 11, 2)   # also ends at index 3 of IDS
+    IDS = torch.tensor([[1, 10, 11, 2, 3, 4, 5, 6]])
+
+    def test_span_vector_lands_on_its_last_token(self):
+        model = concept_model([(self.SPAN_AB, 1.0)], concept_max_span=3)
+        covered = (model.concept(self.IDS)[0] != 0).any(-1)
+        # The span's final token carries it...
+        assert bool(covered[2])
+        # ...its earlier token does not, because at that position the rest of
+        # the span is still the thing being predicted.
+        assert not bool(covered[1])
+        assert not bool(covered[0])
+        assert not bool(covered[3])
+
+    def test_unigram_only_model_leaves_them_uncovered(self):
+        # The same tokens with span matching disabled: this is the gap that
+        # span matching closes.
+        model = concept_model(concept_max_span=1)
+        assert torch.count_nonzero(model.concept(self.IDS)) == 0
+
+    def test_candidates_land_in_their_own_slots(self):
+        model = concept_model(
+            [(self.SPAN_BC, 1.0), (self.SPAN_ABC, 1.0)], concept_max_span=3
+        )
+        _, valid = model.concept.candidates(self.IDS)
+        # Index 3 ends both a length-2 and a length-3 span; distinct slots.
+        assert bool(valid[0, 3, 1]) and bool(valid[0, 3, 2])
+        assert not bool(valid[0, 3, 0])  # no unigram entry for that token
+
+    def test_overlapping_spans_average_rather_than_sum(self):
+        one = concept_model([(self.SPAN_BC, 1.0)], concept_max_span=3)
+        both = concept_model(
+            [(self.SPAN_BC, 1.0), (self.SPAN_ABC, 1.0)], concept_max_span=3
+        )
+        # Index 3 is the end of one span in the first model and of two
+        # identical-vector spans in the second. A mean leaves it unchanged;
+        # a sum would double it.
+        assert torch.allclose(
+            one.concept(self.IDS)[0, 3], both.concept(self.IDS)[0, 3], atol=1e-6
+        )
+
+    def test_span_weight_scales_each_slot(self):
+        # Index 3 ends a length-2 span (fill 1.0) and a length-3 span (fill
+        # 2.0). merge_mean applies each slot's weight, then divides by the
+        # number of valid slots, not by the sum of the weights:
+        # (3 * 1.0 + 0.25 * 2.0) / 2 = 1.75. Distinct fills also catch weights
+        # applied to the wrong slots.
+        model = concept_model(
+            [(self.SPAN_BC, 1.0), (self.SPAN_ABC, 2.0)], concept_max_span=3
+        )
+        fusion = model.concept
+        with torch.no_grad():
+            uniform = fusion(self.IDS)[0, 3].clone()
+            fusion.span_weight.copy_(torch.tensor([1.0, 3.0, 0.25]))
+            merged = fusion.merge_mean(*fusion.candidates(self.IDS))
+            assert torch.allclose(merged[0, 3], torch.full((CONCEPT_DIM,), 1.75))
+            weighted = fusion(self.IDS)[0, 3]
+            assert torch.allclose(
+                weighted, fusion.gates["e"] * fusion.proj(merged[0, 3]), atol=1e-6
+            )
+            assert not torch.allclose(weighted, uniform, atol=1e-6)
+        # A live Parameter: both slots in use at index 3 receive a gradient.
+        fusion(self.IDS).sum().backward()
+        grad = fusion.span_weight.grad
+        assert grad is not None
+        assert torch.count_nonzero(grad[1:]) == 2
+
+    def test_spans_stay_in_their_own_batch_row(self):
+        # Row 0 holds only (4, 5), ending at index 3; row 1 holds only
+        # (10, 11), ending at index 2. A row or position mix-up in the scatter
+        # would move a vector onto the other sequence or the wrong token.
+        ids = torch.tensor([[1, 2, 4, 5, 3, 6, 7, 8], [1, 10, 11, 2, 3, 6, 7, 8]])
+        model = concept_model(
+            [(self.SPAN_AB, 1.0), ((4, 5), 2.0)], concept_max_span=3
+        )
+        cand, valid = model.concept.candidates(ids)
+        expected = torch.zeros(2, ids.shape[1], dtype=torch.bool)
+        expected[0, 3] = True
+        expected[1, 2] = True
+        assert torch.equal(valid[:, :, 1], expected)
+        assert not bool(valid[:, :, 2].any())
+        assert torch.all(cand[0, 3, 1] == 2.0) and torch.all(cand[1, 2, 1] == 1.0)
+        with torch.no_grad():
+            batched = model.concept(ids)
+            for b in range(ids.shape[0]):
+                alone = model.concept(ids[b : b + 1])[0]
+                assert torch.allclose(batched[b], alone, atol=1e-6), b
+        # Decode steps trim the context before matching; same routing there.
+        _, at_2 = model.concept.candidates(ids[:, 2:3], context_ids=ids[:, :3])
+        _, at_3 = model.concept.candidates(ids[:, 3:4], context_ids=ids[:, :4])
+        assert at_2[:, 0, 1].tolist() == [False, True]
+        assert at_3[:, 0, 1].tolist() == [True, False]
+
+    def test_hash_collision_is_a_miss_not_a_wrong_match(self, monkeypatch):
+        # Swap in an order-blind hash before the table is loaded, so the
+        # permuted window (11, 10) collides with the stored span (10, 11).
+        # The stored ids are compared after the hash lookup, so the collision
+        # must not match, while the real span still does.
+        monkeypatch.setattr(
+            main_module, "ngram_keys", lambda x: x.to(torch.int64).sum(-1)
+        )
+        probe = torch.tensor([[10, 11], [11, 10]])
+        keys = main_module.ngram_keys(probe)
+        assert keys[0] == keys[1]
+        model = concept_model([(self.SPAN_AB, 1.0)], concept_max_span=3)
+        _, valid = model.concept.candidates(torch.tensor([[1, 11, 10, 2, 10, 11]]))
+        assert valid[0, :, 1].tolist() == [False, False, False, False, False, True]
+
+    def test_span_survives_the_decode_boundary(self):
+        # Decoding passes a single token, but the span started earlier, so the
+        # match is only possible when the running sequence is supplied.
+        model = concept_model([(self.SPAN_AB, 1.0)], concept_max_span=3)
+        full = torch.tensor([[1, 10, 11]])
+        last = full[:, -1:]
+        assert torch.count_nonzero(model.concept(last, context_ids=full)) > 0
+        assert torch.count_nonzero(model.concept(last)) == 0
+
+    def test_spans_longer_than_config_are_ignored(self):
+        # A table built deeper than the model is configured for still loads
+        # and skips what it cannot match, but warns, since leaving
+        # concept_max_span at its default would otherwise drop every span.
+        cfg = concept_cfg(concept_max_span=2)
+        torch.manual_seed(0)
+        model = OpenMythos(cfg)
+        with pytest.warns(UserWarning, match=r"length \[3\].*concept_max_span=3"):
+            summary = model.load_concept_table(
+                span_payload(cfg.vocab_size, [(self.SPAN_AB, 1.0), (self.SPAN_ABC, 1.0)])
+            )
+        assert summary["spans"] == {2: 1}
+        assert summary["dropped_span_lengths"] == [3]
+
+    def test_no_warning_when_every_span_fits(self):
+        # Only lengths actually present in the payload count. The recorded
+        # build-time max_span says nothing about which lengths were emitted.
+        cfg = concept_cfg(concept_max_span=2)
+        torch.manual_seed(0)
+        model = OpenMythos(cfg)
+        payload = span_payload(cfg.vocab_size, [(self.SPAN_AB, 1.0)])
+        payload["max_span"] = 6
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            summary = model.load_concept_table(payload)
+        assert summary["spans"] == {2: 1}
+        assert summary["dropped_span_lengths"] == []
+
+    def test_full_model_logits_change_with_spans(self):
+        model = concept_model([(self.SPAN_AB, 1.0)], concept_max_span=3)
+        with torch.no_grad():
+            fused = model(self.IDS, n_loops=2)
+            model.use_concept = False
+            baseline = model(self.IDS, n_loops=2)
+        assert not torch.equal(fused, baseline)
+        assert torch.isfinite(fused).all()
+
+
+class TestConceptCausality:
+    """
+    The leak guard. Nothing a token does may change what the model produces at
+    an earlier position. This is the property the span rewrite exists to
+    protect, and it fails on a channel that hands a span's vector to every
+    token it covers.
+
+    The token layout is chosen so a leak cannot hide: (2, 3) is the only span
+    straddling the prefix boundary, and no other span ends at index 3, so a
+    stray write there survives instead of being overwritten by a later one.
+    """
+
+    PREFIX = 4
+    IDS_A = torch.tensor([[1, 10, 11, 2, 3, 4, 5, 6]])
+    IDS_B = torch.tensor([[1, 10, 11, 2, 97, 96, 95, 94]])
+    ENTRIES = [((10, 11), 1.0), ((2, 3), 2.0), ((3, 4, 5), -1.0)]
+
+    def test_candidates_ignore_future_tokens(self):
+        # The mechanism itself, independent of how the rest of the model wires
+        # it up: lookup at a position may not see past that position.
+        model = concept_model(self.ENTRIES, concept_max_span=3)
+        cand_a, valid_a = model.concept.candidates(self.IDS_A)
+        cand_b, valid_b = model.concept.candidates(self.IDS_B)
+        k = self.PREFIX
+        assert torch.equal(cand_a[:, :k], cand_b[:, :k])
+        assert torch.equal(valid_a[:, :k], valid_b[:, :k])
+        # ...and the suffix really does differ, so this is not vacuous.
+        assert not torch.equal(valid_a, valid_b)
+
+    def _check(self, **overrides):
+        model = concept_model(self.ENTRIES, concept_max_span=3, **overrides)
+        with torch.no_grad():
+            a = model(self.IDS_A, n_loops=2)
+            b = model(self.IDS_B, n_loops=2)
+        # Same shapes throughout, so identical inputs must give identical
+        # numerics; any difference in the shared prefix is a genuine leak.
+        assert torch.equal(a[:, : self.PREFIX], b[:, : self.PREFIX])
+        assert not torch.equal(a, b)
+
+    def test_mean_combiner_is_causal(self):
+        self._check(concept_combiner="mean")
+
+    def test_attend_combiner_is_causal(self):
+        self._check(concept_combiner="attend")
+
+    def test_cross_combiner_is_causal(self):
+        self._check(concept_combiner="cross")
+
+    def test_every_site_is_causal(self):
+        for site in ("embed", "e", "attn"):
+            self._check(concept_sites=(site,), concept_combiner="cross")
+
+    def test_all_sites_together_are_causal(self):
+        self._check(concept_sites=("embed", "e", "attn"), concept_combiner="cross")
+
+
+class TestConceptCombiners:
+    IDS = torch.tensor([[1, 10, 11, 2, 3, 4, 5, 6]])
+    ENTRIES = [((10, 11), 1.0), ((11, 2), 0.5)]
+
+    def test_zero_gate_identical_for_every_combiner(self):
+        for combiner in ("mean", "attend", "cross"):
+            cfg = concept_cfg(concept_max_span=3, concept_combiner=combiner)
+            torch.manual_seed(0)
+            model = OpenMythos(cfg).eval()
+            model.load_concept_table(span_payload(cfg.vocab_size, self.ENTRIES))
+            with torch.no_grad():
+                on = model(self.IDS, n_loops=2)
+                model.use_concept = False
+                off = model(self.IDS, n_loops=2)
+            assert torch.equal(on, off), combiner
+
+    def test_combiners_differ_from_each_other(self):
+        # Index 3 ends two spans with different (non-cancelling) vectors; with
+        # a single candidate, attend and mean are the same function. All three
+        # models share every weight they have in common, so only the combiner
+        # logic can make them differ, not a different random init.
+        entries = [((11, 2), 1.0), ((10, 11, 2), 0.5)]
+        models = {
+            c: concept_model(entries, concept_max_span=3, concept_combiner=c)
+            for c in ("mean", "attend", "cross")
+        }
+        _, valid = models["mean"].concept.candidates(self.IDS)
+        assert int(valid.sum(-1).max()) >= 2
+        result = models["attend"].load_state_dict(
+            models["mean"].state_dict(), strict=False
+        )
+        assert set(result.missing_keys) == {
+            "concept.queries.e.weight",
+            "concept.key.weight",
+        }
+        assert not result.unexpected_keys
+        result = models["cross"].load_state_dict(
+            models["attend"].state_dict(), strict=False
+        )
+        assert set(result.missing_keys) == {"concept.value.weight"}
+        assert not result.unexpected_keys
+
+        with torch.no_grad():
+            outs = {c: m(self.IDS, n_loops=2) for c, m in models.items()}
+        assert not torch.equal(outs["mean"], outs["attend"])
+        assert not torch.equal(outs["mean"], outs["cross"])
+        assert not torch.equal(outs["attend"], outs["cross"])
+
+    def test_attend_weights_only_the_valid_candidates(self):
+        # Index 2 has two valid candidates pointing in different directions
+        # (token 11's unigram row and the span (10, 11)) and one empty slot,
+        # which is filled with garbage. The result must be a softmax over the
+        # valid slots alone, and a different query must pick a different mix.
+        cfg = concept_cfg(concept_max_span=3, concept_combiner="attend")
+        payload = span_payload(cfg.vocab_size, [((10, 11), 1.0)])
+        payload["table"][11] = torch.linspace(-2.0, 3.0, CONCEPT_DIM)
+        model = concept_model(
+            payload=payload, concept_max_span=3, concept_combiner="attend"
+        )
+        fusion = model.concept
+
+        cand, valid = fusion.candidates(self.IDS)
+        assert valid[0, 2].tolist() == [True, True, False]
+        cand = cand.clone()
+        torch.manual_seed(1)
+        cand[~valid] = 5.0 * torch.randn_like(cand[~valid])
+        query = 50.0 * torch.randn(1, self.IDS.shape[1], cfg.dim)
+
+        with torch.no_grad():
+            delta = fusion.delta("e", query, cand, valid)
+            live = cand[0, 2, :2]
+            scores = fusion.key(live) @ fusion.queries["e"](query[0, 2])
+            alpha = torch.softmax(scores * fusion.attn_scale, dim=-1)
+            expected = fusion.gates["e"] * fusion.proj(alpha @ live)
+            assert torch.allclose(delta[0, 2], expected, atol=1e-6)
+            other = fusion.delta("e", -query, cand, valid)
+            assert not torch.allclose(delta[0, 2], other[0, 2], atol=1e-4)
+
+    def test_attend_gives_zero_where_no_candidate_exists(self):
+        # Softmax over an all-masked row is uniform, not zero, so the combiner
+        # must zero those positions itself. The empty slots are filled with
+        # non-zero garbage, so relying on them being zero would show here.
+        model = concept_model(
+            [((10, 11), 1.0)], concept_max_span=3, concept_combiner="attend"
+        )
+        cand, valid = model.concept.candidates(self.IDS)
+        query = torch.randn(1, self.IDS.shape[1], model.cfg.dim)
+        dirty = cand.clone()
+        dirty[~valid] = 7.0
+        with torch.no_grad():
+            clean_delta = model.concept.delta("e", query, cand, valid)
+            delta = model.concept.delta("e", query, dirty, valid)
+        assert torch.count_nonzero(delta[0, 0]) == 0
+        assert torch.count_nonzero(delta[0, 2]) > 0
+        # Masked slots get exactly zero weight where a candidate does exist.
+        assert torch.equal(delta[0, 2], clean_delta[0, 2])
+
+    def test_cross_reaches_back_to_an_earlier_concept(self):
+        # The point of cross-attention: a later token can read a concept that
+        # completed before it, which the per-token combiners cannot do.
+        model = concept_model(
+            [((10, 11), 1.0)], concept_max_span=3, concept_combiner="cross"
+        )
+        cand, valid = model.concept.candidates(self.IDS)
+        memory, mem_valid = model.concept.merge_mean(cand, valid), valid.any(-1)
+        query = torch.randn(1, self.IDS.shape[1], model.cfg.dim)
+        delta = model.concept.delta("e", query, cand, valid, memory, mem_valid)
+        covered = [bool(torch.count_nonzero(delta[0, i])) for i in range(8)]
+        # Nothing before the span completes; the span's own last token (index
+        # 2) reads it, and so does every later token.
+        assert covered == [False, False, True, True, True, True, True, True]
+
+    def test_cross_ignores_empty_memory_rows(self):
+        # Empty memory rows must take no attention mass. Garbage written into
+        # them changes nothing (and a position with no readable row stays
+        # zero), and a concept does not fade as uncovered tokens pile up.
+        model = concept_model(
+            [((10, 11), 1.0)], concept_max_span=3, concept_combiner="cross"
+        )
+        fusion = model.concept
+
+        def cross_delta(ids, query, garbage=None):
+            cand, valid = fusion.candidates(ids)
+            memory, mem_valid = fusion.merge_mean(cand, valid), valid.any(-1)
+            if garbage is not None:
+                memory = memory.clone()
+                memory[~mem_valid] = garbage
+            return fusion.delta("e", query, cand, valid, memory, mem_valid)
+
+        short = torch.tensor([[1, 10, 11, 2]])
+        long = torch.tensor([[1, 3, 4, 5, 6, 7, 8, 9, 12, 13, 14, 15, 10, 11, 2]])
+        torch.manual_seed(1)
+        q_short = torch.randn(1, short.shape[1], model.cfg.dim)
+        q_long = torch.randn(1, long.shape[1], model.cfg.dim)
+        q_long[:, -3:] = q_short[:, -3:]  # same queries at the span end and after
+
+        with torch.no_grad():
+            clean = cross_delta(short, q_short)
+            dirty = cross_delta(short, q_short, garbage=5.0)
+            assert torch.count_nonzero(dirty[0, :2]) == 0
+            assert torch.equal(dirty, clean)
+            stretched = cross_delta(long, q_long)
+            assert torch.count_nonzero(clean[0, 2:]) > 0
+            assert torch.allclose(stretched[0, -3:], clean[0, -3:], atol=1e-6)
+
+    def test_cross_decode_cache_matches_full_forward(self):
+        # Decoding extends the concept memory instead of rebuilding it. Feed
+        # the sequence one token at a time, so span completions land on decode
+        # steps, and check every step against a full forward. The memory must
+        # hold exactly one row per token seen: duplicated rows barely move a
+        # softmax, so the length check is what catches a double append.
+        model = concept_model(
+            self.ENTRIES, concept_max_span=3, concept_combiner="cross"
+        )
+        ids = self.IDS
+        _, valid = model.concept.candidates(ids)
+        with torch.no_grad():
+            # A fresh cache keeps ACT from exiting early, as the cached path does.
+            full = model(ids, n_loops=2, kv_cache={})
+            cache = {}
+            for p in range(ids.shape[1]):
+                step = model(
+                    ids[:, p : p + 1],
+                    n_loops=2,
+                    kv_cache=cache,
+                    start_pos=p,
+                    context_ids=ids[:, : p + 1],
+                )
+                memory = cache["concept_memory"]
+                assert memory["m"].shape[1] == p + 1, p
+                assert torch.equal(memory["v"], valid.any(-1)[:, : p + 1]), p
+                assert step.shape == (1, 1, model.cfg.vocab_size)
+                assert torch.allclose(step[:, -1], full[:, p], atol=1e-5), p
+
+
+class TestConceptGenerate:
+    """
+    generate() wiring. Decode steps pass a single token, so the running
+    sequence has to reach the lookup as context_ids and each step must return
+    exactly one position. The sampled token is forced so that decoded tokens
+    complete spans, and every step is checked against a full forward of the
+    running sequence.
+    """
+
+    PROMPT = torch.tensor([[1, 2, 10]])
+    FORCED = 11  # completes (10, 11) on the first decode step, (11, 11) after
+    ENTRIES = [((10, 11), 1.0), ((11, 11), -0.5)]
+
+    @pytest.mark.parametrize(
+        "combiner, sites",
+        [
+            ("mean", ("embed", "e")),
+            ("attend", ("embed", "e", "attn")),
+            ("cross", ("embed", "e", "attn")),
+        ],
+    )
+    def test_decode_steps_match_a_full_forward(self, monkeypatch, combiner, sites):
+        model = concept_model(
+            self.ENTRIES,
+            concept_max_span=3,
+            concept_combiner=combiner,
+            concept_sites=sites,
+        )
+        calls = []
+        forward = model.forward
+
+        def spy(input_ids, **kwargs):
+            out = forward(input_ids, **kwargs)
+            context = kwargs.get("context_ids")
+            calls.append(
+                (
+                    kwargs.get("start_pos"),
+                    None if context is None else context.clone(),
+                    out.clone(),
+                )
+            )
+            return out
+
+        def forced(probs, num_samples):
+            return torch.full((probs.shape[0], num_samples), self.FORCED)
+
+        monkeypatch.setattr(model, "forward", spy)
+        monkeypatch.setattr(torch, "multinomial", forced)
+        steps = 3
+        out = model.generate(self.PROMPT, max_new_tokens=steps, n_loops=2)
+        monkeypatch.undo()
+
+        prompt_len = self.PROMPT.shape[1]
+        assert out.tolist() == [self.PROMPT[0].tolist() + [self.FORCED] * steps]
+        assert len(calls) == steps
+        with torch.no_grad():
+            for i, (start_pos, context, logits) in enumerate(calls):
+                seen = out[:, : prompt_len + i]
+                assert context is not None and torch.equal(context, seen), i
+                if i == 0:
+                    assert start_pos == 0
+                    assert logits.shape == (1, prompt_len, model.cfg.vocab_size)
+                else:
+                    assert start_pos == prompt_len + i - 1
+                    assert logits.shape == (1, 1, model.cfg.vocab_size), i
+                # A fresh cache keeps ACT from exiting early, as generate does.
+                full = model(seen, n_loops=2, kv_cache={})[:, -1]
+                assert torch.allclose(logits[:, -1], full, atol=1e-5), i
+
+
+class TestConceptSites:
+    IDS = torch.tensor([[1, 10, 11, 2, 3, 4, 5, 6]])
+    ENTRIES = [((10, 11), 1.0)]
+
+    @staticmethod
+    def _trace(model, ids):
+        """Forward once, recording the Prelude's input and output and both recurrent inputs."""
+        seen = {}
+
+        def save(name):
+            return lambda module, args, *out: seen.__setitem__(
+                name, (out[0] if out else args[0]).clone()
+            )
+
+        def save_recurrent(module, args):
+            seen["recurrent_h"], seen["recurrent_e"] = args[0].clone(), args[1].clone()
+
+        hooks = [
+            model.prelude[0].register_forward_pre_hook(save("prelude_in")),
+            model.prelude[-1].register_forward_hook(save("prelude_out")),
+            model.recurrent.register_forward_pre_hook(save_recurrent),
+        ]
+        try:
+            with torch.no_grad():
+                seen["logits"] = model(ids, n_loops=2)
+        finally:
+            for h in hooks:
+                h.remove()
+        return seen
+
+    def test_each_site_lands_where_documented(self):
+        # "embed" enters before the Prelude; "e" enters the frozen encoding
+        # only, never the recurrent hidden state; "attn" enters neither. Each
+        # alone still changes the logits.
+        changes = {
+            "embed": dict(prelude_in=True, recurrent_h=True, recurrent_e=True),
+            "e": dict(prelude_in=False, prelude_out=False, recurrent_h=False, recurrent_e=True),
+            "attn": dict(prelude_in=False, prelude_out=False, recurrent_h=False, recurrent_e=False),
+        }
+        for site, expect in changes.items():
+            model = concept_model(
+                self.ENTRIES, concept_max_span=3, concept_sites=(site,)
+            )
+            fused = self._trace(model, self.IDS)
+            model.use_concept = False
+            baseline = self._trace(model, self.IDS)
+            assert not torch.equal(fused["logits"], baseline["logits"]), site
+            for name, changed in expect.items():
+                differs = not torch.equal(fused[name], baseline[name])
+                assert differs == changed, (site, name)
+            with torch.no_grad():
+                delta = model.concept(self.IDS, site=site)
+            if site == "embed":
+                # Exactly the delta, added to the embedding the Prelude receives.
+                shift = fused["prelude_in"] - baseline["prelude_in"]
+                assert torch.allclose(shift, delta, atol=1e-6)
+            if site == "e":
+                shift = fused["recurrent_e"] - baseline["recurrent_e"]
+                assert torch.allclose(shift, delta, atol=1e-6)
+
+    def test_sites_get_their_own_gates(self):
+        model = concept_model(
+            self.ENTRIES, concept_max_span=3, concept_sites=("embed", "e", "attn")
+        )
+        gates = model.concept.gates
+        assert set(gates.keys()) == {"embed", "e", "attn"}
+        # Three distinct Parameters, not one shared under three names...
+        assert len({id(p) for p in gates.values()}) == 3
+        assert sum(".gates." in n for n, _ in model.named_parameters()) == 3
+        # ...so opening one leaves the others shut.
+        with torch.no_grad():
+            for p in gates.values():
+                p.zero_()
+            gates["e"].fill_(1.0)
+        assert torch.count_nonzero(gates["embed"]) == 0
+        assert torch.count_nonzero(gates["attn"]) == 0
+
+    def test_attn_delta_reaches_only_the_attention_input(self):
+        # Unit test on the block. The delta is added after attn_norm, and with
+        # attention stubbed to return zeros it has no other route: the FFN
+        # input and the block output must be unchanged, so it never enters the
+        # residual stream or the feed-forward path.
+        cfg = gqa_cfg()
+        torch.manual_seed(0)
+        block = TransformerBlock(cfg).eval()
+        seen = {"attn": [], "ffn": []}
+        block.attn.forward = lambda x, *args, **kwargs: torch.zeros_like(x)
+        block.attn.register_forward_pre_hook(
+            lambda module, args: seen["attn"].append(args[0].clone())
+        )
+        block.ffn.register_forward_pre_hook(
+            lambda module, args: seen["ffn"].append(args[0].clone())
+        )
+        freqs = precompute_rope_freqs(cfg.dim // cfg.n_heads, cfg.max_seq_len)[:T]
+        x = torch.randn(B, T, cfg.dim)
+        delta = torch.randn(B, T, cfg.dim)
+        with torch.no_grad():
+            plain = block(x, freqs)
+            fused = block(x, freqs, attn_delta=delta)
+            normed = block.attn_norm(x)
+        assert torch.equal(seen["attn"][0], normed)
+        assert torch.allclose(seen["attn"][1], normed + delta, atol=1e-6)
+        assert torch.equal(seen["ffn"][0], seen["ffn"][1])
+        assert torch.equal(plain, fused)
+
+    def test_attn_site_leaves_prelude_and_coda_layers_without_a_delta(self, monkeypatch):
+        # Only the recurrent block's attention receives the "attn" delta: the
+        # Prelude output is bit-identical to the channel switched off, and no
+        # Prelude or Coda layer is handed a delta. The Coda's output does
+        # change, legitimately, because it consumes the recurrent output.
+        model = concept_model(
+            self.ENTRIES, concept_max_span=3, concept_sites=("attn",)
+        )
+        calls = []
+        original = TransformerBlock.forward
+        signature = inspect.signature(original)
+
+        def spy(block, *args, **kwargs):
+            bound = signature.bind(block, *args, **kwargs)
+            bound.apply_defaults()
+            calls.append((bound.arguments["cache_key"], bound.arguments["attn_delta"]))
+            return original(block, *args, **kwargs)
+
+        monkeypatch.setattr(TransformerBlock, "forward", spy)
+        fused = self._trace(model, self.IDS)
+        fused_calls = list(calls)
+        model.use_concept = False
+        baseline = self._trace(model, self.IDS)
+        monkeypatch.undo()
+
+        assert torch.equal(fused["prelude_out"], baseline["prelude_out"])
+        assert not torch.equal(fused["logits"], baseline["logits"])
+        assert any(key.startswith("recurrent") for key, _ in fused_calls)
+        assert any(key.startswith("coda") for key, _ in fused_calls)
+        for key, delta in fused_calls:
+            if key.startswith(("prelude", "coda")):
+                assert delta is None, key
+            else:
+                assert delta is not None and torch.count_nonzero(delta) > 0, key
+
+    def test_mean_attn_delta_is_computed_once_per_forward(self, monkeypatch):
+        # The mean delta ignores the query, so the attn site computes it once
+        # per forward and reuses it on every iteration. The attention
+        # combiners read a query that changes with depth, so they recompute it
+        # each iteration. kv_cache={} keeps ACT from exiting early, so all
+        # n_loops iterations run.
+        n_loops = 3
+        original = ConceptFusion.delta
+        for combiner, expected in (("mean", 1), ("attend", n_loops), ("cross", n_loops)):
+            model = concept_model(
+                self.ENTRIES,
+                concept_max_span=3,
+                concept_combiner=combiner,
+                concept_sites=("attn",),
+            )
+            sites = []
+
+            def spy(fusion, site, *args, **kwargs):
+                sites.append(site)
+                return original(fusion, site, *args, **kwargs)
+
+            monkeypatch.setattr(ConceptFusion, "delta", spy)
+            with torch.no_grad():
+                model(self.IDS, n_loops=n_loops, kv_cache={})
+            monkeypatch.undo()
+            assert sites == ["attn"] * expected, combiner
+
+    def test_unknown_site_is_rejected(self):
+        with pytest.raises(ValueError):
+            OpenMythos(concept_cfg(concept_sites=("nowhere",)))
+        with pytest.raises(ValueError):
+            OpenMythos(concept_cfg(concept_sites=()))
+
+    def test_unknown_combiner_is_rejected(self):
+        with pytest.raises(ValueError):
+            OpenMythos(concept_cfg(concept_combiner="telepathy"))
 
 
 if __name__ == "__main__":

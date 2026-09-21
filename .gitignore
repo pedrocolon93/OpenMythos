@@ -428,3 +428,18 @@ flycheck_*.el
 # network security
 /network-security.data
 
+
+# ---------------------------------------------------------------------------
+# Large training / embedding artifacts
+# ---------------------------------------------------------------------------
+# Line 39 above is a bare ".pt", which matches only a file literally named
+# ".pt" — not the *.pt glob. These entries cover the real cases.
+data/
+checkpoints/
+*.pt
+*.npy
+*.npz
+*.gz
+
+# ConceptNet Numberbatch is CC-BY-SA 4.0 while this repo is MIT. Neither the
+# downloaded vectors nor any table derived from them may be committed.
