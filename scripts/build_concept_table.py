@@ -400,14 +400,23 @@ def fill_vectors(
 
     Returns:
         (span_vectors, per_length_entries, matched_terms, unigram_collisions,
-        span_collisions) where per_length_entries maps span length ->
-        (id tuples, vector row indices).
+        span_collisions, span_terms, unigram_terms) where per_length_entries
+        maps span length -> (id tuples, vector row indices), span_terms names
+        the term behind each span vector row, and unigram_terms names the term
+        behind each covered token id.
+
+    The two term lists are the only record of which concept a row came from:
+    everything else here is keyed by token id. Without them a row is a vector
+    and nothing else, which is enough to inject a concept but not enough to
+    look it up in a graph, so a walk has nowhere to start.
     """
     span_vectors: list[torch.Tensor] = []
     per_length: dict[int, tuple[list[tuple[int, ...]], list[int]]] = {
         n: ([], []) for n in range(2, max_span + 1)
     }
     seen_spans: set[tuple[int, ...]] = set()
+    span_terms: list[str] = []
+    unigram_terms: list[str] = [""] * table.shape[0]
     matched = 0
     unigram_collisions = 0
     span_collisions = 0
@@ -442,6 +451,7 @@ def fill_vectors(
                             continue
                         table[tid] = row
                         mask[tid] = True
+                        unigram_terms[tid] = term
 
                 if seqs:
                     row_index = None
@@ -455,6 +465,7 @@ def fill_vectors(
                         if row_index is None:
                             row_index = len(span_vectors)
                             span_vectors.append(row)
+                            span_terms.append(term)
                         seen_spans.add(tup)
                         grams, rows = per_length[len(tup)]
                         grams.append(tup)
@@ -467,7 +478,10 @@ def fill_vectors(
         if span_vectors
         else torch.zeros(0, dim, dtype=torch.float16)
     )
-    return stacked, per_length, matched, unigram_collisions, span_collisions
+    return (
+        stacked, per_length, matched, unigram_collisions, span_collisions,
+        span_terms, unigram_terms,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -546,7 +560,10 @@ def main() -> None:
     mask = torch.zeros(vocab_size, dtype=torch.bool)
 
     print("Pass 2: reading vectors")
-    span_vectors, per_length, matched, uni_collisions, span_collisions = fill_vectors(
+    (
+        span_vectors, per_length, matched, uni_collisions, span_collisions,
+        span_terms, unigram_terms,
+    ) = fill_vectors(
         args.input, args.lang, unigram_index, span_seqs, table, mask, args.max_span
     )
 
@@ -578,6 +595,11 @@ def main() -> None:
             "mask": mask,
             "spans": spans_payload,
             "span_vectors": span_vectors,
+            # Which term each row came from. Keyed the same way as the
+            # vectors beside them: span_terms[i] names span_vectors[i], and
+            # unigram_terms[t] names table[t] ("" where the row is empty).
+            "span_terms": span_terms,
+            "unigram_terms": unigram_terms,
             "vocab_size": vocab_size,
             "concept_dim": CONCEPT_DIM,
             "max_span": args.max_span,

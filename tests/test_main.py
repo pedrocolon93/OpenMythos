@@ -804,6 +804,22 @@ class TestConceptInjection:
             fused = model(ids, n_loops=2)
         assert not torch.equal(baseline, fused)
 
+    def test_gate_init_opens_every_gate(self):
+        # A zero gate also zeroes the gradient into everything behind it, so a
+        # run can start the gates open instead. The default stays zero, which
+        # every ablation above depends on.
+        torch.manual_seed(0)
+        model = OpenMythos(concept_cfg(concept_gate_init=0.01)).eval()
+        model.load_concept_table(torch.randn(model.cfg.vocab_size, CONCEPT_DIM))
+        for gate in model.concept.gates.values():
+            assert torch.allclose(gate, torch.full_like(gate, 0.01))
+        ids = torch.randint(0, model.cfg.vocab_size, (1, 6))
+        with torch.no_grad():
+            fused = model(ids, n_loops=2)
+            model.use_concept = False
+            off = model(ids, n_loops=2)
+        assert not torch.equal(fused, off)
+
     def test_zero_rows_contribute_nothing(self):
         # Uncovered tokens are all-zero rows. Nothing in the path adds a bias
         # and SiLU maps zero to zero, so they must contribute exactly zero.
@@ -1605,6 +1621,186 @@ class TestConceptSites:
     def test_unknown_combiner_is_rejected(self):
         with pytest.raises(ValueError):
             OpenMythos(concept_cfg(concept_combiner="telepathy"))
+
+
+def graph_payload(vocab_size, n_span_rows, token_node, edges, n_nodes=6):
+    """
+    Build a loadable graph from {node: [(neighbour, weight), ...]}.
+
+    Neighbours are stored strongest-first, the order the real builder writes and
+    the walk relies on, so a test that depends on the cap sees real behaviour.
+    """
+    ptr = [0]
+    idx, rel, weight = [], [], []
+    for node in range(n_nodes):
+        for nbr, w in sorted(edges.get(node, []), key=lambda e: -e[1]):
+            idx.append(nbr)
+            rel.append(0)
+            weight.append(w)
+        ptr.append(len(idx))
+    return {
+        "node_vectors": torch.stack(
+            [torch.full((CONCEPT_DIM,), float(i + 1)) for i in range(n_nodes)]
+        ).to(torch.float16),
+        "node_keys": torch.zeros(n_nodes, 4, dtype=torch.float16),
+        "neigh_ptr": torch.tensor(ptr, dtype=torch.int64),
+        "neigh_idx": torch.tensor(idx, dtype=torch.int32),
+        "neigh_rel": torch.tensor(rel, dtype=torch.int8),
+        "neigh_w": torch.tensor(weight, dtype=torch.float16),
+        "token_node": torch.tensor(token_node, dtype=torch.int32),
+        "span_node": torch.full((n_span_rows,), -1, dtype=torch.int32),
+        "vocab_size": vocab_size,
+    }
+
+
+class TestConceptWalk:
+    """
+    Retrieval: concepts the text does NOT contain, reached by walking out from
+    the ones it does. The walk may only ever start from causally available
+    seeds, so everything the leak guard protects must still hold.
+    """
+
+    @staticmethod
+    def _model(**overrides):
+        cfg = concept_cfg(
+            concept_combiner="attend", concept_walk="fixed", concept_max_span=3, **overrides
+        )
+        torch.manual_seed(0)
+        model = OpenMythos(cfg).eval()
+        table = torch.zeros(cfg.vocab_size, CONCEPT_DIM)
+        # Three tokens carry a concept of their own; every other token has none,
+        # so it has nothing to walk from either.
+        table[5], table[9], table[13] = 1.0, 2.0, 3.0
+        model.load_concept_table(table)
+        token_node = [-1] * cfg.vocab_size
+        token_node[5], token_node[9], token_node[13] = 0, 1, 2
+        model.load_concept_graph(
+            graph_payload(
+                cfg.vocab_size,
+                model.concept.span_vectors.shape[0],
+                token_node,
+                # Node 0's strongest neighbour is 3; the other two seeds lead
+                # elsewhere, so which tokens are present changes what arrives.
+                {0: [(3, 5.0), (1, 4.0), (2, 1.0)], 1: [(4, 3.0)], 2: [(5, 2.0)]},
+            )
+        )
+        return open_gates(model)
+
+    def test_retrieves_neighbours_of_a_present_concept(self):
+        model = self._model(concept_walk_k=2, concept_walk_fanout=3)
+        ids = torch.tensor([[5, 7]])
+        _, valid, nodes = model.concept._candidates(ids, with_nodes=True)
+        ret, ret_valid = model.concept.expand(nodes)
+        # Position 0 holds token 5, so it walks; position 1 has no seed at all.
+        assert ret_valid[0, 0].tolist() == [True, True]
+        assert not ret_valid[0, 1].any()
+        # Strongest edges first: nodes 3 and 1, whose vectors are filled with
+        # their own id plus one.
+        assert ret[0, 0, 0, 0].item() == pytest.approx(4.0)
+        assert ret[0, 0, 1, 0].item() == pytest.approx(2.0)
+        assert torch.equal(ret[0, 1], torch.zeros_like(ret[0, 1]))
+        assert valid[0, 0, 0]
+
+    def test_fanout_caps_what_a_seed_offers(self):
+        # One neighbour considered per seed, so only the strongest arrives.
+        model = self._model(concept_walk_k=2, concept_walk_fanout=1)
+        _, _, nodes = model.concept._candidates(torch.tensor([[5]]), with_nodes=True)
+        ret, ret_valid = model.concept.expand(nodes)
+        assert ret_valid[0, 0].tolist() == [True, False]
+        assert ret[0, 0, 0, 0].item() == pytest.approx(4.0)
+
+    def test_retrieved_concepts_change_logits(self):
+        model = self._model(concept_walk_gate_init=0.5)
+        ids = torch.tensor([[5, 7, 9]])
+        with torch.no_grad():
+            walked = model(ids, n_loops=2)
+            model.concept.walk = "none"
+            plain = model(ids, n_loops=2)
+        assert not torch.equal(walked, plain)
+
+    def test_closed_retrieval_gate_is_the_model_without_it(self):
+        # The arm has to contain its own control: with the retrieval gate at
+        # its zero init, a walking model must be bit-identical to the same
+        # model with the walk switched off. Otherwise a loss cannot be read as
+        # "retrieval does not help" — it could just be the wiring.
+        model = self._model()  # concept_walk_gate_init defaults to 0
+        ids = torch.tensor([[5, 7, 9, 13]])
+        with torch.no_grad():
+            walked = model(ids, n_loops=2)
+            model.concept.walk = "none"
+            plain = model(ids, n_loops=2)
+        assert torch.equal(walked, plain)
+
+    def test_retrieval_does_not_touch_the_other_attention(self):
+        # The position's own candidates are scored in their own softmax, so
+        # what is retrieved cannot take attention away from them.
+        model = self._model(concept_walk_gate_init=0.5)
+        ids = torch.tensor([[5, 9, 13]])
+        query = torch.randn(1, ids.shape[1], model.cfg.dim)
+        with torch.no_grad():
+            ctx = model._concept_context(ids, None, None)
+            own = model.concept.delta("e", query, **{**ctx, "ret": None, "ret_valid": None})
+            both = model.concept.delta("e", query, **ctx)
+            for gate in model.concept.walk_gates.values():
+                torch.nn.init.zeros_(gate)
+            closed = model.concept.delta("e", query, **ctx)
+        assert torch.equal(own, closed)
+        assert not torch.equal(own, both)
+
+    def test_walk_is_causal(self):
+        # The leak guard, extended to retrieval. What the walk owns is the
+        # concept path, and that must be bit-identical over a shared prefix
+        # however the rest of the sequence changes: the seeds come from
+        # candidates(), which cannot see past its own position.
+        model = self._model()
+        a = torch.tensor([[5, 7, 9, 11]])
+        b = torch.tensor([[5, 7, 13, 15]])
+        with torch.no_grad():
+            ctx_a = model._concept_context(a, None, None)
+            ctx_b = model._concept_context(b, None, None)
+            for key in ("cand", "valid", "ret", "ret_valid"):
+                assert torch.equal(ctx_a[key][:, :2], ctx_b[key][:, :2]), key
+            query = torch.randn(1, a.shape[1], model.cfg.dim)
+            delta_a = model.concept.delta("e", query, **ctx_a)
+            delta_b = model.concept.delta("e", query, **ctx_b)
+            assert torch.equal(delta_a[:, :2], delta_b[:, :2])
+            # ...and the tail really does differ, so this is not vacuous.
+            assert not torch.equal(ctx_a["ret"], ctx_b["ret"])
+
+            out_a = model(a, n_loops=2)
+            out_b = model(b, n_loops=2)
+        # Logits over the prefix agree to floating-point noise rather than
+        # exactly: a later token can change which expert it routes to, and that
+        # changes the batch an expert's matmul runs over, which moves every row
+        # in it by ~1e-8. Nothing causal flows through that.
+        assert torch.allclose(out_a[:, :2], out_b[:, :2], atol=1e-6, rtol=0)
+        assert not torch.equal(out_a, out_b)
+
+    def test_forward_needs_a_graph(self):
+        cfg = concept_cfg(concept_combiner="attend", concept_walk="fixed")
+        model = OpenMythos(cfg).eval()
+        model.load_concept_table(torch.zeros(cfg.vocab_size, CONCEPT_DIM))
+        with pytest.raises(RuntimeError, match="no concept graph is loaded"):
+            model(torch.tensor([[1, 2]]), n_loops=2)
+
+    def test_graph_must_match_the_table(self):
+        model = self._model()
+        bad = graph_payload(model.cfg.vocab_size, 99, [-1] * model.cfg.vocab_size, {})
+        with pytest.raises(RuntimeError, match="span rows"):
+            model.load_concept_graph(bad)
+
+    def test_walk_needs_the_attend_combiner(self):
+        with pytest.raises(ValueError, match="attend"):
+            OpenMythos(concept_cfg(concept_combiner="mean", concept_walk="fixed"))
+
+    def test_unknown_walk_is_rejected(self):
+        with pytest.raises(ValueError):
+            OpenMythos(concept_cfg(concept_combiner="attend", concept_walk="teleport"))
+
+    def test_graph_buffers_stay_out_of_state_dict(self):
+        model = self._model()
+        keys = model.state_dict().keys()
+        assert not [k for k in keys if "node" in k or "neigh" in k]
 
 
 if __name__ == "__main__":

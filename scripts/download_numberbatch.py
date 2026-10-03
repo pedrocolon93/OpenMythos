@@ -62,7 +62,7 @@ def _human(n: int) -> str:
     return f"{n:.1f}GB"
 
 
-def download(url: str, dest: str, force: bool = False) -> str:
+def download(url: str, dest: str, force: bool = False, verify_fn=None) -> str:
     """
     Stream `url` to `dest`, writing to a temp file and renaming on success.
 
@@ -77,17 +77,21 @@ def download(url: str, dest: str, force: bool = False) -> str:
     rejected rather than silently reused.
 
     Args:
-        url   -- source URL
-        dest  -- final path to write
-        force -- re-download even if `dest` already exists
+        url       -- source URL
+        dest      -- final path to write
+        force     -- re-download even if `dest` already exists
+        verify_fn -- archive check to run before the rename and on the
+                     skip-if-exists path; defaults to the Numberbatch header
+                     check below. download_conceptnet_edges.py passes its own.
 
     Returns:
         The path written (== dest).
     """
+    verify_fn = verify_fn or verify
     if os.path.exists(dest) and not force:
         print(f"Already present, skipping download: {dest} ({_human(os.path.getsize(dest))})")
         print("Pass --force to re-download.")
-        verify(dest)
+        verify_fn(dest)
         return dest
 
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
@@ -148,7 +152,7 @@ def download(url: str, dest: str, force: bool = False) -> str:
             )
 
         # Catches truncation when no Content-Length was sent (chunked responses).
-        verify(tmp)
+        verify_fn(tmp)
         os.replace(tmp, dest)
         replaced = True
     except KeyboardInterrupt:

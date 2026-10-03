@@ -12,6 +12,9 @@ from the same base initialization, and varies only the concept channel:
                  but it now carries some other term's vector
   shuffled       rows and span vectors permuted independently, which also breaks
                  those shared-vector groups (a weaker control, kept for contrast)
+  shuffled_graph real vectors, but the ConceptNet adjacency is relabeled: every
+                 node keeps its degree and every retrieved concept is still a
+                 real one, just not a related one. The control for --walk.
 
 Both controls keep coverage, vector statistics and parameter count identical to
 "real". shuffled_tied is the one a knowledge claim should be judged by: the
@@ -41,6 +44,14 @@ These say what is injected at a position, not what can reach it. Once a vector
 joins the residual stream, the model's own causal attention can carry it to any
 later position under every combiner, so after_span and none are not placebo
 positions, and a gain there is not by itself evidence that cross's memory works.
+
+With --walk, a position also retrieves concepts the text does NOT contain, by
+walking out from the ones it does (one hop, strongest edges first). Those
+retrieved concepts are read by their own attention and added through their own
+gate, so they cannot take attention away from the position's own concepts: with
+that gate at zero the run IS the run with --walk none. Judge a walking run
+against that arm, which isolates what retrieval adds, and against --variant
+shuffled_graph, which isolates the content of what is retrieved from its count.
 
 Run:
     python tests/concept_benchmark.py prepare
@@ -220,7 +231,32 @@ def load_payload(path: str, variant: str = "real", seed: int = 0) -> dict:
         relabeled = distinct[torch.randperm(distinct.shape[0], generator=g)][inverse]
         table[covered] = relabeled[: covered.numel()]
         return {**payload, "table": table, "span_vectors": relabeled[covered.numel():].contiguous()}
+    if variant == "shuffled_graph":
+        return payload  # the vectors are real; only the graph is broken
     raise ValueError(f"unknown table variant {variant!r}")
+
+
+def load_graph_payload(path: str, variant: str = "real", seed: int = 0) -> dict:
+    """
+    Load the ConceptNet graph, or a control that keeps its shape and loses its
+    meaning.
+
+    The control relabels node ids inside the adjacency only: every node keeps
+    its degree and every edge still points at a real concept with a real
+    vector, but at the wrong one. A walk therefore retrieves the same NUMBER of
+    concepts, at the same positions, with the same vector statistics, and only
+    the relation between a position and what it retrieves is destroyed.
+
+    Without this, a "real" arm would be compared against arms whose graph was
+    left untouched, and the comparison would measure nothing about the graph.
+    """
+    payload = torch.load(path, map_location="cpu")
+    if variant == "real":
+        return payload
+    g = torch.Generator().manual_seed(SHUFFLE_SEED + seed + 7919)
+    n_nodes = payload["node_vectors"].shape[0]
+    perm = torch.randperm(n_nodes, generator=g)
+    return {**payload, "neigh_idx": perm[payload["neigh_idx"].long()].to(torch.int32)}
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +293,11 @@ def build_model(args: argparse.Namespace, vocab_size: int):
         concept_sites=tuple(args.sites.split(",")),
         concept_combiner=args.combiner,
         concept_attn_dim=64,
+        concept_gate_init=args.gate_init,
+        concept_walk=args.walk,
+        concept_walk_k=args.walk_k,
+        concept_walk_fanout=args.walk_fanout,
+        concept_walk_gate_init=args.walk_gate_init,
     )
     torch.manual_seed(args.seed)
     model = OpenMythos(cfg)
@@ -406,7 +447,7 @@ def run(args: argparse.Namespace) -> None:
     real_payload = load_payload(args.table, "real")
     cat_cfg = dataclasses.replace(
         cfg, use_concept_injection=True, concept_dim=300, concept_max_span=args.max_span,
-        concept_sites=("e",), concept_combiner="mean",
+        concept_sites=("e",), concept_combiner="mean", concept_walk="none",
     )
     fusion = ConceptFusion(cat_cfg).to(device)
     fusion.load(real_payload, tokenizer_id=args.tokenizer)
@@ -416,6 +457,13 @@ def run(args: argparse.Namespace) -> None:
         payload = real_payload if args.variant == "real" else load_payload(args.table, args.variant, args.seed)
         load_summary = model.load_concept_table(payload, tokenizer_id=args.tokenizer)
     del real_payload
+
+    graph_summary = None
+    if args.walk != "none":
+        graph_summary = model.load_concept_graph(
+            load_graph_payload(args.graph, args.variant, args.seed), tokenizer_id=args.tokenizer
+        )
+        print(f"[{args.name}] graph {graph_summary}", flush=True)
 
     n_params = count_params(model)
     concept_params = sum(p.numel() for n, p in model.named_parameters() if n.startswith("concept."))
@@ -478,7 +526,7 @@ def run(args: argparse.Namespace) -> None:
     result = {
         "name": args.name,
         "variant": args.variant,
-        "combiner": args.combiner if args.variant != "baseline" else None,
+        "combiner": arm_combiner(args) if args.variant != "baseline" else None,
         "sites": args.sites if args.variant != "baseline" else None,
         "seed": args.seed,
         "tag": args.tag,
@@ -497,6 +545,12 @@ def run(args: argparse.Namespace) -> None:
         "warmup": args.warmup,
         "weight_decay": args.weight_decay,
         "max_span": args.max_span,
+        "gate_init": args.gate_init,
+        "walk": args.walk,
+        "walk_k": args.walk_k if args.walk != "none" else None,
+        "walk_fanout": args.walk_fanout if args.walk != "none" else None,
+        "walk_gate_init": args.walk_gate_init if args.walk != "none" else None,
+        "graph_summary": graph_summary,
         "shuffle_seed": SHUFFLE_SEED + args.seed if args.variant.startswith("shuffled") else None,
         "final_eval": final,
         "tok_per_sec": timed_tokens / max(1e-9, timed_seconds),
@@ -512,6 +566,12 @@ def run(args: argparse.Namespace) -> None:
             for s, g in model.concept.gates.items()
         }
         result["span_weight"] = model.concept.span_weight.detach().float().cpu().tolist()
+        if args.walk != "none":
+            result["walk_gates"] = {
+                s: {"l2": g.detach().float().norm().item(),
+                    "mean_abs": g.detach().float().abs().mean().item()}
+                for s, g in model.concept.walk_gates.items()
+            }
         x0, _ = next(iter(eval_loader))
         result["delta_ratio"] = delta_ratios(model, x0.to(device))
 
@@ -529,7 +589,7 @@ def run(args: argparse.Namespace) -> None:
 
 
 CONCEPT_ARMS = [("mean", "e"), ("cross", "e"), ("attend", "embed,e,attn")]
-VARIANT_ORDER = ("real", "shuffled_tied", "shuffled")
+VARIANT_ORDER = ("real", "shuffled_tied", "shuffled", "shuffled_graph")
 
 # Runs are only comparable when these match; report() and sweep() check them.
 FINGERPRINT_KEYS = ("steps", "batch_size", "seq_len", "dim", "lr")
@@ -548,6 +608,11 @@ def grid(name: str) -> list[tuple]:
         if name == "full" and sites == "e":
             specs.append(("shuffled", combiner, sites))
     return specs
+
+
+def arm_combiner(args: argparse.Namespace) -> str:
+    """Combiner name as the report should show it, walk included."""
+    return args.combiner if args.walk == "none" else f"{args.combiner}_walk{args.walk}"
 
 
 def run_name(variant, combiner, sites, seed, tag="") -> str:
@@ -578,6 +643,7 @@ def sweep(args: argparse.Namespace) -> None:
         "--log-every", str(args.log_every), "--device", args.device, "--threads", str(args.threads),
         "--cache-dir", args.cache_dir, "--table", args.table, "--results-dir", args.results_dir,
         "--tokenizer", args.tokenizer, "--max-span", str(args.max_span),
+        "--gate-init", str(args.gate_init),
     ]
 
     def launch(spec):
@@ -706,7 +772,7 @@ def report(args: argparse.Namespace) -> None:
                 c: paired(seeds, base, lambda r, c=c: r["final_eval"]["categories"][c]["loss"]) for c in CATEGORIES
             }
             if variant == "real":
-                for control in ("shuffled_tied", "shuffled"):
+                for control in ("shuffled_tied", "shuffled", "shuffled_graph"):
                     other = by_key.get(f"{control}/{combiner}/{sites}")
                     if other:
                         row[f"vs_{control}"] = paired(seeds, other, loss)
@@ -1043,6 +1109,23 @@ def parse_args() -> argparse.Namespace:
         sp.add_argument("--eval-batches", type=int, default=20)
         sp.add_argument("--log-every", type=int, default=100)
         sp.add_argument("--max-span", type=int, default=6)
+        sp.add_argument("--walk", choices=["none", "fixed"], default="none",
+                        help="retrieve concepts the text does not contain by walking the graph")
+        sp.add_argument("--graph", default="data/concept_graph_gpt2.pt",
+                        help="graph from scripts/build_concept_graph.py; only read when --walk is set")
+        sp.add_argument("--walk-k", type=int, default=4, help="retrieved concepts kept per position")
+        sp.add_argument("--walk-gate-init", type=float, default=0.0,
+                        help="starting value for the retrieval gates; 0 makes the arm start as "
+                        "exactly the model with --walk none")
+        sp.add_argument("--walk-fanout", type=int, default=4, help="neighbours considered per seed")
+        sp.add_argument(
+            "--gate-init",
+            type=float,
+            default=0.0,
+            help="starting value for every concept gate; 0 keeps the run baseline-identical "
+            "at step 0, a small positive value gives the layers behind the gate a gradient "
+            "from the first step",
+        )
         sp.add_argument("--device", default="mps" if torch.backends.mps.is_available() else "cpu")
         sp.add_argument("--threads", type=int, default=2)
 
@@ -1056,7 +1139,11 @@ def parse_args() -> argparse.Namespace:
     rp = sub.add_parser("run", help="train and evaluate one configuration")
     common(rp)
     training(rp)
-    rp.add_argument("--variant", choices=["baseline", "real", "shuffled", "shuffled_tied"], required=True)
+    rp.add_argument(
+        "--variant",
+        choices=["baseline", "real", "shuffled", "shuffled_tied", "shuffled_graph"],
+        required=True,
+    )
     rp.add_argument("--combiner", choices=["mean", "attend", "cross"], default="mean")
     rp.add_argument("--sites", default="e")
     rp.add_argument("--seed", type=int, default=0)

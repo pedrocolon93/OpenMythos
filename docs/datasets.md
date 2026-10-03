@@ -170,3 +170,76 @@ in the sequence, so its delta is not zero.
 the downloaded vectors nor the derived table may be committed; both are covered
 by `.gitignore`. Attribution: Robyn Speer, Joshua Chin and Catherine Havasi
 (2017), "ConceptNet 5.5: An Open Multilingual Graph of General Knowledge".
+
+## ConceptNet graph (optional retrieval of concepts the text lacks)
+
+The table above can only inject concepts the text already contains. The graph
+adds the other direction: from a concept a position has, walk out to related
+concepts it does not have, and let the model attend over those too. Numberbatch
+was retrofitted on this graph, so the relations are implicit in the vectors,
+but only the assertions dump carries them explicitly.
+
+| Resource | Source | Size | License |
+|---|---|---|---|
+| ConceptNet 5.7 assertions | [conceptnet5 downloads](https://github.com/commonsense/conceptnet5/wiki/Downloads) | ~500MB gzipped | CC-BY-SA 4.0 |
+
+```bash
+python scripts/download_conceptnet_edges.py
+python scripts/build_concept_graph.py \
+    --edges data/conceptnet/conceptnet-assertions-5.7.0.csv.gz \
+    --table data/concept_table_gpt2.pt \
+    --out data/concept_graph_gpt2.pt
+```
+
+**Download.** Same machinery as the vectors: streamed to a `.part` file,
+byte count checked against `Content-Length`, whole archive decompressed, and
+the first row checked for five tab-separated fields with `/a/`, `/r/` and
+`/c/` URIs. No checksum, no resume.
+
+**Building the graph.** The builder needs a table built by the current
+`build_concept_table.py`, which records the term behind each row (`span_terms`,
+`unigram_terms`). Without those a row is a vector and nothing else, and a walk
+has nowhere to start. Rebuild an older table before running this.
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--max-degree` | `32` | Neighbours kept per node, strongest edges first. ConceptNet hubs have tens of thousands of edges, almost all weak. |
+| `--min-weight` | `1.0` | Drop edges below this weight. |
+| `--held-out` | `20000` | Probe edges removed from the adjacency entirely. |
+| `--key-dim` | `32` | Width of the per-node scoring keys. |
+
+Nodes are English terms that appear in the assertions *and* have a Numberbatch
+vector, so anything a walk reaches can also be injected. Edges are stored in
+both directions, the reverse carrying its own relation id, and each node's
+neighbours are sorted strongest-first so taking the top few needs no scoring.
+The output also carries a `--key-dim` projection of every node vector: a walk
+scores many more candidates than it keeps, and scoring narrow before gathering
+300 dimensions is what keeps per-position retrieval affordable.
+
+**Using it.**
+
+```python
+cfg = MythosConfig(
+    ..., use_concept_injection=True, concept_max_span=6,
+    concept_combiner="attend",   # the walk needs attend; it scores retrieved slots
+    concept_walk="fixed",        # "none" (default) or "fixed"
+    concept_walk_k=4,            # retrieved concepts kept per position
+    concept_walk_fanout=4,       # neighbours considered per seed concept
+)
+model = OpenMythos(cfg)
+model.load_concept_table("data/concept_table_gpt2.pt")
+model.load_concept_graph("data/concept_graph_gpt2.pt")   # table first: it is checked against it
+```
+
+Retrieved vectors join the position's own candidates in one softmax, so the two
+compete for the same attention, and the gate is shared with the site. The
+architecture is identical with `concept_walk="none"`, which is what makes that
+setting the control to judge a walking run against.
+
+**Causality.** A walk starts only from nodes a position reached causally, so it
+inherits the table's causality: no retrieved concept can depend on a later
+token. `tests/test_main.py::TestConceptWalk::test_walk_is_causal` asserts the
+concept path is bit-identical over a shared prefix.
+
+**Licensing:** the ConceptNet assertions are CC-BY-SA 4.0, as is any graph
+derived from them, and `.gitignore` covers `data/`. Attribution as above.
