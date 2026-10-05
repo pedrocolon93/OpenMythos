@@ -86,6 +86,9 @@ from open_mythos.main import ConceptFusion  # noqa: E402
 from tests.small_benchmark import build_tiny_cfg, count_params, fmt_count  # noqa: E402
 
 CATEGORIES = ("span_end", "unigram", "after_span", "none")
+# Half precision for the forward and backward pass only. Weights, the optimizer
+# and every reported loss stay float32, so a bf16 run is still measured exactly.
+AMP_DTYPES = {"fp32": None, "bf16": torch.bfloat16, "fp16": torch.float16}
 AFTER_SPAN_WINDOW = 16
 SHUFFLE_SEED = 1234
 
@@ -471,6 +474,16 @@ def run(args: argparse.Namespace) -> None:
 
     opt = torch.optim.AdamW(param_groups(model, args.weight_decay), lr=args.lr, betas=(0.9, 0.95))
 
+    # Autocast runs the matmuls at half width and keeps a float32 copy of the
+    # weights, so memory per token drops and a bigger --batch-size fits. fp16
+    # also needs loss scaling, because its exponent range is narrow enough that
+    # small gradients flush to zero; bf16 keeps float32's range and does not.
+    amp_dtype = AMP_DTYPES[args.precision]
+    if amp_dtype is not None and device.type == "cuda" and amp_dtype is torch.bfloat16:
+        if not torch.cuda.is_bf16_supported():
+            raise SystemExit("this GPU has no bfloat16 support; use --precision fp16 or fp32")
+    scaler = torch.amp.GradScaler(device.type, enabled=args.precision == "fp16")
+
     train_curve, eval_curve = [], []
     data_iter = iter(train_loader)
     timed_tokens, timed_seconds = 0, 0.0
@@ -488,12 +501,17 @@ def run(args: argparse.Namespace) -> None:
 
         t0 = time.perf_counter()
         model.train()
-        logits = model(x)
+        with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+            logits = model(x)
+        # The loss itself is always float32: cross entropy over 50k classes is
+        # where half precision would actually cost accuracy.
         loss = F.cross_entropy(logits.float().view(-1, vocab_size), y.view(-1))
         opt.zero_grad(set_to_none=True)
-        loss.backward()
+        scaler.scale(loss).backward()
+        scaler.unscale_(opt)  # clip real gradients, not scaled ones
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
+        scaler.step(opt)
+        scaler.update()
         loss_val = loss.item()  # forces a device sync, so the timing below is honest
         dt = time.perf_counter() - t0
         if not math.isfinite(loss_val):
@@ -546,6 +564,10 @@ def run(args: argparse.Namespace) -> None:
         "weight_decay": args.weight_decay,
         "max_span": args.max_span,
         "gate_init": args.gate_init,
+        "precision": args.precision,
+        "peak_mem_gb": (
+            torch.cuda.max_memory_allocated() / (1 << 30) if device.type == "cuda" else None
+        ),
         "walk": args.walk,
         "walk_k": args.walk_k if args.walk != "none" else None,
         "walk_fanout": args.walk_fanout if args.walk != "none" else None,
@@ -643,7 +665,7 @@ def sweep(args: argparse.Namespace) -> None:
         "--log-every", str(args.log_every), "--device", args.device, "--threads", str(args.threads),
         "--cache-dir", args.cache_dir, "--table", args.table, "--results-dir", args.results_dir,
         "--tokenizer", args.tokenizer, "--max-span", str(args.max_span),
-        "--gate-init", str(args.gate_init),
+        "--gate-init", str(args.gate_init), "--precision", args.precision,
     ]
 
     def launch(spec):
@@ -1109,6 +1131,12 @@ def parse_args() -> argparse.Namespace:
         sp.add_argument("--eval-batches", type=int, default=20)
         sp.add_argument("--log-every", type=int, default=100)
         sp.add_argument("--max-span", type=int, default=6)
+        sp.add_argument(
+            "--precision", choices=["fp32", "bf16", "fp16"], default="fp32",
+            help="half precision for the forward/backward pass; weights, optimizer and "
+            "every reported loss stay fp32. Changes numerics, so keep one setting across "
+            "an experiment rather than mixing arms",
+        )
         sp.add_argument("--walk", choices=["none", "fixed"], default="none",
                         help="retrieve concepts the text does not contain by walking the graph")
         sp.add_argument("--graph", default="data/concept_graph_gpt2.pt",
