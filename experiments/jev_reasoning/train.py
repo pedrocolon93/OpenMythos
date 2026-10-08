@@ -10,9 +10,12 @@ Arms (--arm):
                with mean --mean-loops (Geiping et al., 2025), backprop through
                only the last --grad-loops of them
 
-Training uses chains of 1..--train-hops statements. Evaluation goes beyond
-that in both hops and loops, so the grid shows whether extra loops are spent
-on harder problems and whether either axis extrapolates.
+Training climbs a curriculum (see curriculum()): from a cold start even one
+hop sits on a long loss plateau, so it begins with 2 chains of 1 statement
+and moves up a level whenever training accuracy holds at --advance-acc. The
+last level is the full task with chains of 1..--train-hops statements.
+Evaluation goes beyond that in both hops and loops, so the grid shows whether
+extra loops are spent on harder problems and whether either axis extrapolates.
 
     python train.py --arm random --steps 20000 --device cuda
 """
@@ -56,6 +59,24 @@ def model_config(args, task: TaskConfig) -> MythosConfig:
         rope_theta=10000.0,
         use_act=args.arm == "act",
     )
+
+
+def curriculum(train_hops: int, final: TaskConfig):
+    """
+    Levels as (max query hops, task config). Distractor chains grow with the
+    query chain so that length never gives the answer's depth away; the last
+    level is the full task.
+    """
+    levels = [
+        (1, TaskConfig(n_chains=2, max_distractor_hops=1, noul_frac=final.noul_frac)),
+        (1, TaskConfig(n_chains=final.n_chains, max_distractor_hops=2, noul_frac=final.noul_frac)),
+    ]
+    for k in range(2, train_hops):
+        levels.append(
+            (k, TaskConfig(n_chains=final.n_chains, max_distractor_hops=k, noul_frac=final.noul_frac))
+        )
+    levels.append((train_hops, final))
+    return levels
 
 
 def sample_loops(rng: np.random.Generator, mean: float, sigma: float = 0.5) -> int:
@@ -127,6 +148,7 @@ def main():
     ap.add_argument("--mean-loops", type=float, default=8.0, help="random arm")
     ap.add_argument("--grad-loops", type=int, default=8, help="random arm")
     ap.add_argument("--train-hops", type=int, default=8)
+    ap.add_argument("--advance-acc", type=float, default=0.9)
     ap.add_argument("--eval-hops", type=int, default=16)
     ap.add_argument("--eval-every", type=int, default=2000)
     ap.add_argument("--per-hop", type=int, default=256)
@@ -162,12 +184,15 @@ def main():
         else torch.autocast("cpu", enabled=False)
     )
 
+    levels = curriculum(args.train_hops, task)
+    level, level_steps = 0, [0]
     log, evals = [], []
     t0, run_loss, run_acc = time.time(), 0.0, 0.0
     for step in range(args.steps):
         for g in opt.param_groups:
             g["lr"] = lr_at(step, args)
-        b = train_batch(rng, args.batch_size, args.train_hops, task, args.device)
+        max_hops, level_task = levels[level]
+        b = train_batch(rng, args.batch_size, max_hops, level_task, args.device)
         if args.arm == "random":
             n, gl = sample_loops(rng, args.mean_loops), args.grad_loops
         else:
@@ -194,9 +219,14 @@ def main():
                 "train_acc": run_acc / 100,
                 "gnorm": gnorm.item(),
                 "lr": opt.param_groups[0]["lr"],
+                "level": level,
                 "elapsed": time.time() - t0,
             }
             log.append(rec)
+            if rec["train_acc"] >= args.advance_acc and level + 1 < len(levels):
+                level += 1
+                level_steps.append(step + 1)
+                print(f"level {level} at step {step + 1}: {levels[level]}", flush=True)
             run_loss = run_acc = 0.0
             if (step + 1) % 500 == 0:
                 print(json.dumps(rec), flush=True)
@@ -223,6 +253,9 @@ def main():
             "train_minutes": (time.time() - t0) / 60,
             "log": log,
             "evals": evals,
+            "level_steps": level_steps,
+            "final_level": level,
+            "n_levels": len(levels),
             "grid": grid,
         },
         open(out / f"{name}.json", "w"),
