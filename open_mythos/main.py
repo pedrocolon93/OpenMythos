@@ -69,6 +69,10 @@ class MythosConfig:
                            among that position's candidates) or "cross" (causal
                            cross-attention over concepts completed so far)
         concept_attn_dim-- query/key width for the "attend" and "cross" combiners
+        concept_router  -- "mix" puts a small learned router in front of the
+                           "attn" site, choosing per loop iteration and per
+                           position WHICH concept source feeds the attention
+                           input: see the concept_router_* fields below
     """
 
     vocab_size: int = 32000
@@ -135,6 +139,49 @@ class MythosConfig:
     # all on the first step: the channel has to bootstrap through the gate.
     # A small positive value trades that identity for a gradient from step one.
     concept_gate_init: float = 0.0
+    # Per-iteration path picker for the "attn" site. "none" | "mix". "mix" adds
+    # a router that chooses, at every loop iteration and for every position,
+    # which concept source feeds the attention input, so different depths can
+    # draw on different material as the state evolves. Needs "attn" in
+    # concept_sites and concept_combiner="attend": those are the only site and
+    # combiner for which "per iteration" means anything (see ConceptFusion).
+    concept_router: str = "none"
+    # The router's action space, a subset of ("none", "own", "memory", "walk"):
+    # supply nothing, this position's own concepts, the concepts completed
+    # earlier in the sequence, or the retrieved graph neighbours. "none" is a
+    # real action, not the absence of one — "no concept at this depth" is a
+    # hypothesis about the loop too. "walk" additionally needs concept_walk on,
+    # and is out of the default because retrieval measured dead on its own.
+    concept_router_paths: tuple = ("none", "own", "memory")
+    # How the discrete choice is made differentiable:
+    #   "soft"   convex mixture of the path outputs; every path gets gradient
+    #            every step, which is what lets a path behind a closed gate
+    #            bootstrap at all
+    #   "gumbel" straight-through Gumbel-softmax, sampled while training and a
+    #            deterministic argmax in eval so decoding is reproducible
+    #   "hard"   straight-through top-1, no noise: exactly one path forward
+    concept_router_mode: str = "soft"
+    # Softmax / Gumbel temperature for the router logits.
+    concept_router_temp: float = 1.0
+    # What halted positions do. A halted position contributes nothing to the
+    # block output through its own row, but its delta still changes its key and
+    # value rows, so it is still a concept SOURCE for the positions that are
+    # still running — which is why "free" (everyone routes) is the default.
+    # "live" zeroes the router on halted positions, dropping them back to the
+    # status-quo path, and exists to test whether their freedom costs variance.
+    concept_router_halt: str = "free"
+    # The router is an interpolation away from the status quo, not a
+    # replacement for it: out = status + gate * (routed - status). At zero the
+    # model is bit-identical to the same model with the router off, so the arm
+    # nests inside its own control. One hands the choice fully to the router.
+    # Same zero-start trade as concept_gate_init: the router sees no gradient
+    # until the gate moves.
+    concept_router_gate_init: float = 0.0
+    # The "memory" path's own gate. It is new material no measurement covers,
+    # so it gets the concept_walk_gate_init treatment: at zero the router's
+    # "memory" action is initially indistinguishable from "none", and the
+    # router can learn to want the memory before the memory may speak.
+    concept_router_mem_gate_init: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -907,13 +954,17 @@ class RecurrentBlock(nn.Module):
                         Can be increased at inference for deeper reasoning (depth extrapolation).
             kv_cache -- cache dict passed through to the inner TransformerBlock;
                         each loop iteration uses a separate cache key
-            attn_delta_fn -- optional callable mapping the block input (B, T, dim)
-                        to a delta added to the attention input each iteration.
-                        Used by the "attn" concept site; the query changes with
-                        depth, so an attention combiner can select differently
-                        at each iteration. With the "mean" combiner the delta
-                        is query-independent and the callable returns the same
-                        precomputed tensor every iteration.
+            attn_delta_fn -- optional callable (block_input, loop_t, halted) ->
+                        delta, called once per iteration; the delta is added to
+                        the attention input only. Used by the "attn" concept
+                        site; the query changes with depth, so an attention
+                        combiner can select differently at each iteration. With
+                        the "mean" combiner the delta is query-independent and
+                        the callable returns the same precomputed tensor every
+                        iteration. `loop_t` is the current iteration index and
+                        `halted` the (B, T) mask of positions that stopped
+                        contributing to the output on an earlier iteration —
+                        the concept path picker reads both.
 
         Returns:
             ACT-weighted sum of hidden states across iterations, shape (B, T, dim)
@@ -929,7 +980,9 @@ class RecurrentBlock(nn.Module):
             h_loop = loop_index_embedding(h, t, self.loop_dim)
             combined = self.norm(h_loop + e)
             cache_key = f"recurrent_loop_{t}"
-            attn_delta = attn_delta_fn(combined) if attn_delta_fn is not None else None
+            attn_delta = (
+                attn_delta_fn(combined, t, halted) if attn_delta_fn is not None else None
+            )
             trans_out = self.block(
                 combined, freqs_cis, mask, kv_cache, cache_key, attn_delta=attn_delta
             )
@@ -1008,6 +1061,10 @@ def ngram_keys(x: torch.Tensor) -> torch.Tensor:
 CONCEPT_SITES = ("embed", "e", "attn")
 CONCEPT_COMBINERS = ("mean", "attend", "cross")
 CONCEPT_WALKS = ("none", "fixed")
+CONCEPT_ROUTERS = ("none", "mix")
+CONCEPT_ROUTER_PATHS = ("none", "own", "memory", "walk")
+CONCEPT_ROUTER_MODES = ("soft", "gumbel", "hard")
+CONCEPT_ROUTER_HALTS = ("free", "live")
 
 
 class ConceptFusion(nn.Module):
@@ -1049,6 +1106,28 @@ class ConceptFusion(nn.Module):
     identical to one with fusion switched off. Gates start at
     cfg.concept_gate_init, which is zero unless a run is deliberately probing
     what the zero start costs the layers behind the gate.
+
+    cfg.concept_router="mix" adds a per-iteration PATH PICKER in front of the
+    "attn" site, the only site the recurrent loop re-enters every iteration.
+    At iteration t a small router scores the configured actions — supply
+    nothing, this position's own concepts, the concepts completed earlier in
+    the sequence, or the retrieved graph neighbours — from the very tensor the
+    delta is about to join, plus a per-depth bias row, and weighs the paths'
+    outputs accordingly. Different iterations can therefore draw on different
+    material as the state evolves.
+
+    Two properties the router is built around:
+
+    - It mixes already-normalised PATH OUTPUTS, never slots. Every path keeps
+      its own softmax and its own gate, because a shared softmax between a
+      position's own concepts and retrieved ones cost 0.020 nats by making the
+      two compete for one pool of attention mass.
+    - It is an interpolation away from the status quo, not a replacement for
+      it: out = status + router_gate * (routed - status), where status is
+      exactly the delta this class produces with the router off. At the zero
+      gate init the two are bit-identical, so the arm nests inside its control;
+      and at init the proven own-concept path arrives at FULL strength rather
+      than at 1/n_paths, which a plain softmax router would have cost it.
     """
 
     def __init__(self, cfg: MythosConfig):
@@ -1097,6 +1176,73 @@ class ConceptFusion(nn.Module):
                     f"concept_walk_k and concept_walk_fanout must be >= 1, got "
                     f"{self.walk_k} and {self.walk_fanout}"
                 )
+
+        self.router = getattr(cfg, "concept_router", "none")
+        self.router_paths = tuple(
+            getattr(cfg, "concept_router_paths", ("none", "own", "memory"))
+        )
+        self.router_mode = getattr(cfg, "concept_router_mode", "soft")
+        self.router_temp = float(getattr(cfg, "concept_router_temp", 1.0))
+        self.router_halt = getattr(cfg, "concept_router_halt", "free")
+        if self.router not in CONCEPT_ROUTERS:
+            raise ValueError(
+                f"concept_router must be one of {CONCEPT_ROUTERS}, got {self.router!r}"
+            )
+        if self.router != "none":
+            if "attn" not in self.sites:
+                # "embed" and "e" are applied once per forward, so a router
+                # there would not be per-iteration at all — a different
+                # experiment wearing this one's name.
+                raise ValueError(
+                    f"concept_router={self.router!r} needs 'attn' in concept_sites, "
+                    f"the only site the loop re-enters every iteration; got {self.sites!r}"
+                )
+            if self.combiner != "attend":
+                # The "own" path IS the attend read. Under "mean" the delta is
+                # query-independent and computed once per forward, which is the
+                # opposite of what a per-iteration router needs.
+                raise ValueError(
+                    f"concept_router={self.router!r} needs concept_combiner='attend', "
+                    f"got {self.combiner!r}"
+                )
+            unknown = [p for p in self.router_paths if p not in CONCEPT_ROUTER_PATHS]
+            if unknown:
+                raise ValueError(
+                    f"concept_router_paths must be a subset of {CONCEPT_ROUTER_PATHS}, "
+                    f"got {self.router_paths!r}"
+                )
+            if len(set(self.router_paths)) != len(self.router_paths):
+                raise ValueError(
+                    f"concept_router_paths must not repeat an action, got {self.router_paths!r}"
+                )
+            if not [p for p in self.router_paths if p != "none"]:
+                raise ValueError(
+                    "concept_router_paths needs at least one action other than "
+                    f"'none', got {self.router_paths!r}"
+                )
+            if "walk" in self.router_paths and self.walk == "none":
+                raise ValueError(
+                    "the 'walk' router path needs concept_walk set, since it reads "
+                    "what the walk retrieves"
+                )
+            if self.router_mode not in CONCEPT_ROUTER_MODES:
+                raise ValueError(
+                    f"concept_router_mode must be one of {CONCEPT_ROUTER_MODES}, "
+                    f"got {self.router_mode!r}"
+                )
+            if self.router_halt not in CONCEPT_ROUTER_HALTS:
+                raise ValueError(
+                    f"concept_router_halt must be one of {CONCEPT_ROUTER_HALTS}, "
+                    f"got {self.router_halt!r}"
+                )
+            if not self.router_temp > 0:
+                raise ValueError(
+                    f"concept_router_temp must be > 0, got {self.router_temp}"
+                )
+        # Whether anything needs the concept memory materialised. The "cross"
+        # combiner always does; with the router it is the "memory" path's
+        # material, and nothing else builds it.
+        self.router_memory = self.router != "none" and "memory" in self.router_paths
 
         # Every lookup structure is a NON-persistent buffer, so checkpoints stay
         # small (no hundreds of MB of table) and independent of which table is
@@ -1189,6 +1335,46 @@ class ConceptFusion(nn.Module):
                     for s in self.sites
                 }
             )
+
+        if self.router != "none":
+            n_paths = len(self.router_paths)
+            # Scored from the attention input itself, which already carries the
+            # loop index in its first dim//8 channels, so the router can
+            # condition on depth through the same query the paths are scored
+            # within. Only the "attn" site routes, so one projection, not one
+            # per site.
+            self.router_proj = nn.Linear(cfg.dim, n_paths, bias=False)
+            # The direct parameterisation of "iteration t prefers path p".
+            # Reading the loop index back out of dim//8 sinusoidal channels
+            # through a learned projection is a roundabout way to say it, and
+            # this costs max_loop_iters * n_paths parameters. Raw Parameter and
+            # zero-init, so _init_weights cannot clobber the neutral start;
+            # rows beyond the trained depth are clamped to the last one, the
+            # convention LoRAAdapter uses for depth extrapolation.
+            self.router_depth_bias = nn.Parameter(
+                torch.zeros(cfg.max_loop_iters, n_paths)
+            )
+            # The interpolation weight from the status quo to the router's
+            # choice. Raw Parameter; zero makes the router an exact no-op.
+            self.router_gate_init = float(getattr(cfg, "concept_router_gate_init", 0.0))
+            self.router_gate = nn.Parameter(
+                torch.full((cfg.dim,), self.router_gate_init)
+            )
+            if self.router_memory:
+                # The memory read gets its own query, key, value and gate. Same
+                # reasoning as retrieval: a read that shares a softmax with the
+                # position's own candidates takes attention away from them.
+                self.router_mem_query = nn.Linear(cfg.dim, attn_dim, bias=False)
+                self.router_mem_key = nn.Linear(cfg.concept_dim, attn_dim, bias=False)
+                self.router_mem_value = nn.Linear(
+                    cfg.concept_dim, cfg.concept_dim, bias=False
+                )
+                self.router_mem_gate_init = float(
+                    getattr(cfg, "concept_router_mem_gate_init", 0.0)
+                )
+                self.router_mem_gate = nn.Parameter(
+                    torch.full((cfg.dim,), self.router_mem_gate_init)
+                )
 
         # Plain attribute, not a buffer: it never enters state_dict, so it resets
         # on every construction and checkpoint resume, just like the tables.
@@ -1537,6 +1723,113 @@ class ConceptFusion(nn.Module):
 
     # -- combining -------------------------------------------------------
 
+    def _read_slots(
+        self,
+        query: torch.Tensor,
+        slots: torch.Tensor,
+        valid: torch.Tensor,
+        q_proj: nn.Module,
+        k_proj: nn.Module,
+    ) -> torch.Tensor:
+        """
+        Score a position's own slots against its hidden state and pool them.
+
+        One softmax over one position's slots and nothing else, which is what
+        keeps every concept source from competing for a shared pool of
+        attention mass. Positions with no valid slot get exactly zero: the mask
+        zeroes the weights and every projection here is bias-free.
+
+        Args:
+            query  -- (B, T, dim) hidden state at the site
+            slots  -- (B, T, S, concept_dim) candidates for each position
+            valid  -- (B, T, S)
+            q_proj -- Linear(dim -> attn_dim) owned by this read
+            k_proj -- Linear(concept_dim -> attn_dim) owned by this read
+
+        Returns:
+            (B, T, concept_dim)
+        """
+        q = q_proj(query)  # (B, T, a)
+        k = k_proj(slots.to(q.dtype))  # (B, T, S, a)
+        scores = (k * q.unsqueeze(2)).sum(-1) * self.attn_scale  # (B, T, S)
+        scores = scores.masked_fill(~valid, torch.finfo(scores.dtype).min)
+        alpha = F.softmax(scores, dim=-1) * valid.any(-1, keepdim=True).to(scores.dtype)
+        return (alpha.unsqueeze(-1) * slots.to(alpha.dtype)).sum(2)
+
+    def _read_memory(
+        self,
+        query: torch.Tensor,
+        memory: torch.Tensor,
+        mem_valid: torch.Tensor,
+        q_proj: nn.Module,
+        k_proj: nn.Module,
+        v_proj: nn.Module,
+    ) -> torch.Tensor:
+        """
+        Causal cross-attention over the sequence's concept memory.
+
+        Args:
+            query     -- (B, T, dim) hidden state at the site
+            memory    -- (B, L, concept_dim); the T query positions are the
+                         LAST T of the L memory rows
+            mem_valid -- (B, L) which memory rows hold a vector
+            q_proj    -- Linear(dim -> attn_dim) owned by this read
+            k_proj    -- Linear(concept_dim -> attn_dim) owned by this read
+            v_proj    -- Linear(concept_dim -> concept_dim) owned by this read
+
+        Returns:
+            (B, T, concept_dim)
+        """
+        T = query.shape[1]
+        L = memory.shape[1]
+        q = q_proj(query)  # (B, T, a)
+        k = k_proj(memory.to(q.dtype))  # (B, L, a)
+        v = v_proj(memory.to(q.dtype))  # (B, L, concept_dim)
+        scores = torch.matmul(q, k.transpose(1, 2)) * self.attn_scale  # (B, T, L)
+        # Query i sits at absolute position L-T+i and may read memory rows
+        # at or before it. Reading later rows would leak future tokens.
+        q_pos = torch.arange(T, device=query.device) + (L - T)
+        m_pos = torch.arange(L, device=query.device)
+        allowed = (m_pos[None, :] <= q_pos[:, None])[None] & mem_valid[:, None, :]
+        scores = scores.masked_fill(~allowed, torch.finfo(scores.dtype).min)
+        alpha = F.softmax(scores, dim=-1) * allowed.any(-1, keepdim=True).to(scores.dtype)
+        return torch.matmul(alpha, v)
+
+    def router_weights(self, query: torch.Tensor, loop_t: int = 0) -> torch.Tensor:
+        """
+        Mass on each configured path, per position, at one loop iteration.
+
+        The logits come from the attention input the delta is about to join —
+        which already carries the loop index in its leading channels — plus the
+        depth bias row for this iteration. Rows past the trained depth reuse
+        the last one, the same clamp LoRAAdapter applies for depth
+        extrapolation.
+
+        Args:
+            query  -- (B, T, dim) the block input at this iteration
+            loop_t -- current loop index
+
+        Returns:
+            (B, T, n_paths) weights summing to one over the last dimension.
+            "soft" returns the softmax; "gumbel" and "hard" return a one-hot
+            carrying a straight-through gradient, and "gumbel" samples only
+            while training so eval and decoding stay reproducible.
+        """
+        max_t = self.router_depth_bias.shape[0] - 1
+        bias = self.router_depth_bias[loop_t if loop_t <= max_t else max_t]
+        logits = self.router_proj(query) + bias
+
+        if self.router_mode == "gumbel" and self.training:
+            # tau scales the noise as well as the logits, so it goes to
+            # gumbel_softmax rather than being divided out beforehand.
+            return F.gumbel_softmax(logits, tau=self.router_temp, hard=True, dim=-1)
+
+        soft = F.softmax(logits / self.router_temp, dim=-1)
+        if self.router_mode == "soft":
+            return soft
+        hard = F.one_hot(soft.argmax(-1), soft.shape[-1]).to(soft.dtype)
+        return hard + soft - soft.detach()
+
     def delta(
         self,
         site: str,
@@ -1547,6 +1840,8 @@ class ConceptFusion(nn.Module):
         mem_valid: Optional[torch.Tensor] = None,
         ret: Optional[torch.Tensor] = None,
         ret_valid: Optional[torch.Tensor] = None,
+        loop_t: int = 0,
+        halted: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Combine candidates for one site and return the gated delta.
@@ -1556,61 +1851,86 @@ class ConceptFusion(nn.Module):
             query     -- (B, T, dim) hidden state at the site; unused by "mean"
             cand      -- (B, T, K, concept_dim) from candidates()
             valid     -- (B, T, K)
-            memory    -- (B, L, concept_dim) concept memory, "cross" only; the
-                         T query positions are the LAST T of the L memory rows
+            memory    -- (B, L, concept_dim) concept memory, needed by the
+                         "cross" combiner and by the router's "memory" path;
+                         the T query positions are the LAST T of the L rows
             mem_valid -- (B, L) which memory rows hold a vector
             ret       -- (B, T, R, concept_dim) retrieved by expand(), "attend"
                          only; read by its own attention and added through its
                          own gate, so it cannot take attention away from the
                          position's own candidates
             ret_valid -- (B, T, R)
+            loop_t    -- loop iteration index, read by the path picker only
+            halted    -- (B, T) positions that stopped contributing to the block
+                         output on an earlier iteration; read by the path picker
+                         under concept_router_halt="live" only
 
         Returns:
             (B, T, dim) delta, already scaled by the site's gate
         """
         if self.combiner == "mean":
             feat = self.merge_mean(cand, valid)
-
         elif self.combiner == "attend":
-            q = self.queries[site](query)  # (B, T, a)
-            k = self.key(cand.to(q.dtype))  # (B, T, K, a)
-            scores = (k * q.unsqueeze(2)).sum(-1) * self.attn_scale  # (B, T, K)
-            scores = scores.masked_fill(~valid, torch.finfo(scores.dtype).min)
-            alpha = F.softmax(scores, dim=-1) * valid.any(-1, keepdim=True).to(scores.dtype)
-            feat = (alpha.unsqueeze(-1) * cand.to(alpha.dtype)).sum(2)
-
+            feat = self._read_slots(query, cand, valid, self.queries[site], self.key)
         else:  # "cross"
-            B, T = query.shape[:2]
-            L = memory.shape[1]
-            q = self.queries[site](query)  # (B, T, a)
-            k = self.key(memory.to(q.dtype))  # (B, L, a)
-            v = self.value(memory.to(q.dtype))  # (B, L, concept_dim)
-            scores = torch.matmul(q, k.transpose(1, 2)) * self.attn_scale  # (B, T, L)
-            # Query i sits at absolute position L-T+i and may read memory rows
-            # at or before it. Reading later rows would leak future tokens.
-            q_pos = torch.arange(T, device=query.device) + (L - T)
-            m_pos = torch.arange(L, device=query.device)
-            allowed = (m_pos[None, :] <= q_pos[:, None])[None] & mem_valid[:, None, :]
-            scores = scores.masked_fill(~allowed, torch.finfo(scores.dtype).min)
-            alpha = F.softmax(scores, dim=-1) * allowed.any(-1, keepdim=True).to(scores.dtype)
-            feat = torch.matmul(alpha, v)
+            feat = self._read_memory(
+                query, memory, mem_valid, self.queries[site], self.key, self.value
+            )
 
-        out = self.gates[site] * self.proj(feat.to(self.proj[0].weight.dtype))
+        own_term = self.gates[site] * self.proj(feat.to(self.proj[0].weight.dtype))
+        out = own_term
 
+        walk_term = None
         if ret is not None:
             # A second, independent read over the retrieved concepts. Positions
-            # that retrieved nothing get exactly zero here: the mask zeroes the
-            # weights and the projection is bias-free.
-            q = self.walk_queries[site](query)
-            k = self.walk_key(ret.to(q.dtype))
-            scores = (k * q.unsqueeze(2)).sum(-1) * self.attn_scale
-            scores = scores.masked_fill(~ret_valid, torch.finfo(scores.dtype).min)
-            beta = F.softmax(scores, dim=-1) * ret_valid.any(-1, keepdim=True).to(scores.dtype)
-            walked = (beta.unsqueeze(-1) * ret.to(beta.dtype)).sum(2)
-            out = out + self.walk_gates[site] * self.proj(
+            # that retrieved nothing get exactly zero here.
+            walked = self._read_slots(
+                query, ret, ret_valid, self.walk_queries[site], self.walk_key
+            )
+            walk_term = self.walk_gates[site] * self.proj(
                 walked.to(self.proj[0].weight.dtype)
             )
-        return out
+            out = out + walk_term
+
+        if self.router == "none" or site != "attn":
+            return out
+
+        # `out` is the status quo: exactly the delta this site produces with
+        # the router off. The router interpolates away from it, so a zero gate
+        # reproduces that delta bit-identically and the proven own-concept path
+        # starts at full strength rather than at 1/n_paths.
+        terms = {"none": None, "own": own_term, "walk": walk_term}
+        if self.router_memory:
+            mem_feat = self._read_memory(
+                query,
+                memory,
+                mem_valid,
+                self.router_mem_query,
+                self.router_mem_key,
+                self.router_mem_value,
+            )
+            terms["memory"] = self.router_mem_gate * self.proj(
+                mem_feat.to(self.proj[0].weight.dtype)
+            )
+
+        pi = self.router_weights(query, loop_t)
+        routed = None
+        for i, path in enumerate(self.router_paths):
+            term = terms.get(path)
+            if term is None:  # the "none" action, and "walk" with nothing retrieved
+                continue
+            weighted = pi[..., i : i + 1].to(term.dtype) * term
+            routed = weighted if routed is None else routed + weighted
+        if routed is None:
+            routed = torch.zeros_like(out)
+
+        gate = self.router_gate
+        if self.router_halt == "live" and halted is not None:
+            # Positions that have halted drop back to the status quo — their own
+            # concepts at full strength — rather than to whatever the router
+            # would have picked for a state that no longer reaches the output.
+            gate = gate * (~halted).unsqueeze(-1).to(gate.dtype)
+        return out + gate * (routed - out)
 
     def forward(
         self,
@@ -1618,6 +1938,7 @@ class ConceptFusion(nn.Module):
         context_ids: Optional[torch.Tensor] = None,
         site: Optional[str] = None,
         query: Optional[torch.Tensor] = None,
+        loop_t: int = 0,
     ) -> torch.Tensor:
         """
         Convenience: candidates then delta for one site, no memory cache.
@@ -1632,11 +1953,21 @@ class ConceptFusion(nn.Module):
         if self.combiner != "mean" and query is None:
             raise ValueError(f"combiner {self.combiner!r} needs a query tensor")
         memory = mem_valid = ret = ret_valid = None
-        if self.combiner == "cross":
+        if self.combiner == "cross" or self.router_memory:
             memory, mem_valid = self.merge_mean(cand, valid), valid.any(-1)
         if walking:
             ret, ret_valid = self.expand(nodes)
-        return self.delta(site, query, cand, valid, memory, mem_valid, ret, ret_valid)
+        return self.delta(
+            site,
+            query,
+            cand,
+            valid,
+            memory,
+            mem_valid,
+            ret,
+            ret_valid,
+            loop_t=loop_t,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1754,7 +2085,9 @@ class OpenMythos(nn.Module):
 
         The memory only ever grows by the new positions, so during decoding it
         is kept in the same kv_cache dict the attention layers use, under the
-        key "concept_memory", and extended rather than rebuilt each step.
+        key "concept_memory", and extended rather than rebuilt each step. It is
+        built for the "cross" combiner and for the path picker's "memory"
+        action, and skipped entirely when neither asks for it.
         """
         walking = self.concept.walk != "none"
         cand, valid, nodes = self.concept._candidates(
@@ -1770,7 +2103,7 @@ class OpenMythos(nn.Module):
         }
         if walking:
             ctx["ret"], ctx["ret_valid"] = self.concept.expand(nodes)
-        if self.concept.combiner == "cross":
+        if self.concept.combiner == "cross" or self.concept.router_memory:
             new_mem = self.concept.merge_mean(cand, valid)
             new_valid = valid.any(-1)
             if kv_cache is not None and "concept_memory" in kv_cache:
@@ -1917,11 +2250,12 @@ class OpenMythos(nn.Module):
                 if self.concept.combiner == "mean":
                     # The mean delta ignores the query, so compute it once and
                     # reuse it every iteration; autograd sums the gradients.
+                    # The router needs "attend", so it never lands here.
                     attn_delta = self.concept.delta("attn", None, **concept).to(x.dtype)
-                    attn_delta_fn = lambda combined: attn_delta  # noqa: E731
+                    attn_delta_fn = lambda combined, t, halted: attn_delta  # noqa: E731
                 else:
-                    attn_delta_fn = lambda combined: self.concept.delta(  # noqa: E731
-                        "attn", combined, **concept
+                    attn_delta_fn = lambda combined, t, halted: self.concept.delta(  # noqa: E731
+                        "attn", combined, **concept, loop_t=t, halted=halted
                     ).to(combined.dtype)
         x = self.recurrent(
             x, e, freqs_cis, mask, n_loops, kv_cache, attn_delta_fn=attn_delta_fn

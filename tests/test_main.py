@@ -1199,6 +1199,19 @@ class TestConceptCausality:
     def test_all_sites_together_are_causal(self):
         self._check(concept_sites=("embed", "e", "attn"), concept_combiner="cross")
 
+    def test_router_is_causal(self):
+        # The path picker, through the same guard. Its own "memory" path reads
+        # back over the sequence, so it is the one new way a later token could
+        # reach an earlier one; both router gates are opened at construction,
+        # since open_gates only moves the site gates.
+        self._check(
+            concept_sites=("attn",),
+            concept_combiner="attend",
+            concept_router="mix",
+            concept_router_gate_init=1.0,
+            concept_router_mem_gate_init=0.5,
+        )
+
 
 class TestConceptCombiners:
     IDS = torch.tensor([[1, 10, 11, 2, 3, 4, 5, 6]])
@@ -1801,6 +1814,551 @@ class TestConceptWalk:
         model = self._model()
         keys = model.state_dict().keys()
         assert not [k for k in keys if "node" in k or "neigh" in k]
+
+
+class TestConceptRouter:
+    """
+    The per-iteration path picker. At loop iteration t a small router chooses,
+    per position, WHICH concept source feeds the attention input: nothing, the
+    position's own concepts, the concepts completed earlier in the sequence, or
+    the retrieved graph neighbours.
+
+    Two invariants everything here protects. The router is an interpolation
+    away from the status quo, so at its zero gate init the model is
+    bit-identical to the same model with the router off and the arm contains
+    its own control. And it mixes already-normalised path outputs, never slots,
+    so no path can take attention mass away from another.
+    """
+
+    IDS = torch.tensor([[1, 10, 11, 2, 3, 4, 5, 6]])
+    ENTRIES = [((10, 11), 1.0), ((2, 3), 2.0)]
+
+    @staticmethod
+    def _model(entries=None, **overrides):
+        overrides.setdefault("concept_combiner", "attend")
+        overrides.setdefault("concept_sites", ("attn",))
+        overrides.setdefault("concept_router", "mix")
+        overrides.setdefault("concept_max_span", 3)
+        overrides.setdefault("concept_gate_init", 0.7)
+        return concept_model(
+            TestConceptRouter.ENTRIES if entries is None else entries, **overrides
+        )
+
+    @staticmethod
+    def _assert_one_hot(pi):
+        """Exactly one path per position, up to the straight-through residual."""
+        # hard + soft - soft.detach() leaves a float residual of ~1e-8, so the
+        # one-hot is checked by value rather than by bit equality.
+        assert bool(((pi > 0.5).sum(-1) == 1).all())
+        assert torch.allclose(pi.max(-1).values, torch.ones_like(pi[..., 0]), atol=1e-5)
+        assert torch.allclose(pi.sum(-1), torch.ones_like(pi[..., 0]), atol=1e-5)
+
+    @staticmethod
+    def _ctx_and_query(model, ids):
+        """The context a forward would build, and a fixed query to score it with."""
+        ctx = model._concept_context(ids, None, None)
+        torch.manual_seed(3)
+        return ctx, torch.randn(1, ids.shape[1], model.cfg.dim)
+
+    def test_disabled_by_default(self):
+        assert MythosConfig().concept_router == "none"
+        model = concept_model(self.ENTRIES, concept_max_span=3)
+        assert model.concept.router == "none"
+        assert model.concept.router_memory is False
+        for name in ("router_proj", "router_depth_bias", "router_gate"):
+            assert not hasattr(model.concept, name), name
+        assert not [n for n, _ in model.named_parameters() if "concept.router" in n]
+
+    def test_gate_and_depth_bias_start_where_configured(self):
+        # Raw Parameters, so _init_weights (which runs last and reinitializes
+        # every Linear and Embedding) must not have touched them.
+        model = self._model(concept_router_mem_gate_init=0.25)
+        assert torch.count_nonzero(model.concept.router_gate) == 0
+        assert torch.count_nonzero(model.concept.router_depth_bias) == 0
+        assert model.concept.router_depth_bias.shape == (
+            model.cfg.max_loop_iters,
+            len(model.concept.router_paths),
+        )
+        assert torch.allclose(
+            model.concept.router_mem_gate, torch.full_like(model.concept.router_mem_gate, 0.25)
+        )
+        opened = self._model(concept_router_gate_init=0.3)
+        assert torch.allclose(
+            opened.concept.router_gate, torch.full_like(opened.concept.router_gate, 0.3)
+        )
+
+    def test_closed_router_is_the_model_without_it(self):
+        # The nesting property. With the interpolation gate at its zero init a
+        # routed model must be bit-identical to the same weights with the
+        # router switched off, so a loss can only ever be read as the router's.
+        # Mutating the attribute rather than building a second model keeps the
+        # shared weights: the router's Linears consume the init RNG.
+        model = self._model()
+        with torch.no_grad():
+            routed = model(self.IDS, n_loops=3, kv_cache={})
+            model.concept.router = "none"
+            plain = model(self.IDS, n_loops=3, kv_cache={})
+        assert torch.equal(routed, plain)
+
+    def test_open_router_changes_the_logits(self):
+        # ...and the test above is not vacuous: once the gate is open the
+        # router really does move the model.
+        model = self._model(
+            concept_router_gate_init=1.0, concept_router_mem_gate_init=0.5
+        )
+        with torch.no_grad():
+            routed = model(self.IDS, n_loops=3, kv_cache={})
+            model.concept.router = "none"
+            plain = model(self.IDS, n_loops=3, kv_cache={})
+        assert not torch.equal(routed, plain)
+
+    def test_router_weights_live_under_concept(self):
+        # tests/concept_benchmark.py's build_model copies a baseline's
+        # state_dict into the channel's model and rejects anything missing that
+        # is not a concept.* key, so every new parameter has to live there.
+        base = OpenMythos(gqa_cfg())
+        model = self._model(
+            concept_router_gate_init=0.5, concept_router_mem_gate_init=0.5
+        )
+        missing, unexpected = model.load_state_dict(base.state_dict(), strict=False)
+        assert not unexpected
+        assert not [k for k in missing if not k.startswith("concept.")]
+        assert [k for k in missing if k.startswith("concept.router")]
+
+    def _select(self, model, path, ids=None):
+        """Force the router onto one path and return the delta it produces."""
+        ids = self.IDS if ids is None else ids
+        fusion = model.concept
+        idx = fusion.router_paths.index(path)
+        with torch.no_grad():
+            fusion.router_proj.weight.zero_()  # logits are the depth bias alone
+            fusion.router_depth_bias.zero_()
+            fusion.router_depth_bias[:, idx] = 1.0
+            fusion.router_gate.fill_(1.0)  # hand the choice fully to the router
+        ctx, query = self._ctx_and_query(model, ids)
+        with torch.no_grad():
+            pi = fusion.router_weights(query, 0)
+            routed = fusion.delta("attn", query, **ctx)
+            fusion.router = "none"
+            status = fusion.delta("attn", query, **ctx)
+            fusion.router = "mix"
+        # mode="hard" makes the one-hot exact, so the assertions below can be too.
+        assert torch.equal(pi.argmax(-1), torch.full_like(pi.argmax(-1), idx))
+        return routed, status
+
+    def test_the_none_path_supplies_exactly_nothing(self):
+        # "no concept at this depth" is a real action, not the absence of one,
+        # and at gate one it has to zero the delta exactly.
+        model = self._model(concept_router_mode="hard")
+        routed, status = self._select(model, "none")
+        assert torch.count_nonzero(routed) == 0
+        assert torch.count_nonzero(status) > 0
+
+    def test_the_own_path_reproduces_the_status_quo(self):
+        # Picking the position's own concepts at gate one must land exactly on
+        # the delta the model produces with no router at all.
+        model = self._model(concept_router_mode="hard")
+        routed, status = self._select(model, "own")
+        assert torch.equal(routed, status)
+
+    def test_the_memory_path_supplies_concepts_completed_earlier(self):
+        model = self._model(
+            concept_router_mode="hard", concept_router_mem_gate_init=0.5
+        )
+        routed, status = self._select(model, "memory")
+        assert torch.count_nonzero(routed) > 0
+        assert not torch.equal(routed, status)
+        # Its material really is the memory: a position before the first span
+        # completes has nothing to read back to, while later ones do. Token 10
+        # at index 1 carries no unigram, so (10, 11) ending at index 2 is the
+        # first concept in the sequence.
+        covered = [bool(torch.count_nonzero(routed[0, i])) for i in range(8)]
+        assert covered[0] is False and covered[1] is False
+        assert all(covered[2:])
+
+    def test_the_memory_path_has_its_own_gate(self):
+        # New material no measurement covers gets the retrieval treatment: at
+        # its zero init the "memory" action is indistinguishable from "none",
+        # so the router can learn to want it before it may speak.
+        model = self._model(concept_router_mode="hard")
+        routed, _ = self._select(model, "memory")
+        assert torch.count_nonzero(routed) == 0
+
+    def test_the_walk_path_supplies_retrieved_neighbours(self):
+        model = TestConceptWalk._model(
+            concept_sites=("attn",),
+            concept_router="mix",
+            concept_router_paths=("none", "own", "walk"),
+            concept_router_mode="hard",
+            concept_walk_gate_init=0.5,
+        )
+        ids = torch.tensor([[5, 7, 9, 13]])
+        routed, status = self._select(model, "walk", ids=ids)
+        assert torch.count_nonzero(routed) > 0
+        assert not torch.equal(routed, status)
+        # Only the seeded positions retrieved anything, so only they are
+        # non-zero once the walk is the only path feeding the site.
+        covered = [bool(torch.count_nonzero(routed[0, i])) for i in range(4)]
+        assert covered == [True, False, True, True]
+
+    def test_memory_is_built_only_when_a_path_asks_for_it(self):
+        # The memory read is the one new per-iteration cost, quadratic in
+        # sequence length, so a router that cannot use it must not pay for it.
+        plain = self._model(concept_router_paths=("none", "own"))
+        assert plain.concept.router_memory is False
+        assert plain._concept_context(self.IDS, None, None)["memory"] is None
+        for name in ("router_mem_query", "router_mem_gate"):
+            assert not hasattr(plain.concept, name), name
+        wants = self._model()
+        assert wants.concept.router_memory is True
+        assert wants._concept_context(self.IDS, None, None)["memory"] is not None
+
+    def test_choice_varies_across_iterations(self):
+        # The whole point: the query is the attention input at this depth, so
+        # the decision is free to move as the state evolves. kv_cache={} keeps
+        # ACT from exiting early, so every iteration runs.
+        model = self._model(concept_router_gate_init=1.0)
+        seen = []
+        original = ConceptFusion.router_weights
+
+        def spy(fusion, query, loop_t=0):
+            weights = original(fusion, query, loop_t)
+            seen.append((loop_t, weights.clone()))
+            return weights
+
+        ConceptFusion.router_weights = spy
+        try:
+            with torch.no_grad():
+                model(self.IDS, n_loops=3, kv_cache={})
+        finally:
+            ConceptFusion.router_weights = original
+
+        assert [t for t, _ in seen] == [0, 1, 2]
+        assert not all(torch.equal(seen[0][1], w) for _, w in seen)
+
+    def test_the_depth_bias_can_switch_the_choice_per_iteration(self):
+        # The direct parameterisation of "iteration t prefers path p". The
+        # loop-index channels alone only nudge the weights; this is what lets a
+        # trained router hand different material to different depths outright.
+        model = self._model(concept_router_mode="hard")
+        fusion = model.concept
+        n_paths = len(fusion.router_paths)
+        with torch.no_grad():
+            fusion.router_proj.weight.zero_()
+            fusion.router_depth_bias.zero_()
+            for t in range(model.cfg.max_loop_iters):
+                fusion.router_depth_bias[t, t % n_paths] = 1.0
+        query = torch.randn(1, 4, model.cfg.dim)
+        picks = [
+            int(fusion.router_weights(query, t).argmax(-1)[0, 0])
+            for t in range(model.cfg.max_loop_iters)
+        ]
+        assert picks == [t % n_paths for t in range(model.cfg.max_loop_iters)]
+
+    def test_depth_bias_clamps_past_the_trained_depth(self):
+        # Depth extrapolation: at inference n_loops can exceed max_loop_iters,
+        # and iterations beyond the trained range reuse the last learned row
+        # rather than indexing out of bounds — LoRAAdapter's convention.
+        model = self._model()
+        fusion = model.concept
+        with torch.no_grad():
+            torch.nn.init.normal_(fusion.router_depth_bias)
+        query = torch.randn(1, 4, model.cfg.dim)
+        last = model.cfg.max_loop_iters - 1
+        assert torch.equal(
+            fusion.router_weights(query, last), fusion.router_weights(query, last + 5)
+        )
+        assert not torch.equal(
+            fusion.router_weights(query, 0), fusion.router_weights(query, last)
+        )
+        with torch.no_grad():  # ...and a deeper forward still runs
+            model(self.IDS, n_loops=model.cfg.max_loop_iters + 2, kv_cache={})
+
+    def test_soft_mode_is_a_convex_mixture(self):
+        # Every path gets gradient every step, which is what lets a path behind
+        # a closed gate bootstrap at all.
+        model = self._model(concept_router_mode="soft")
+        query = torch.randn(1, 4, model.cfg.dim)
+        pi = model.concept.router_weights(query, 1)
+        assert pi.shape == (1, 4, len(model.concept.router_paths))
+        assert torch.allclose(pi.sum(-1), torch.ones(1, 4), atol=1e-6)
+        assert bool((pi > 0).all())
+
+    def test_hard_mode_picks_exactly_one_path(self):
+        model = self._model(concept_router_mode="hard")
+        query = torch.randn(1, 4, model.cfg.dim)
+        for training in (True, False):
+            model.train(training)
+            self._assert_one_hot(model.concept.router_weights(query, 1))
+        model.eval()
+        # Deterministic: no noise, so the same query gives the same pick twice.
+        assert torch.equal(
+            model.concept.router_weights(query, 1),
+            model.concept.router_weights(query, 1),
+        )
+
+    def test_gumbel_samples_while_training_and_is_deterministic_in_eval(self):
+        model = self._model(concept_router_mode="gumbel")
+        query = torch.randn(1, 16, model.cfg.dim)
+        model.train()
+        torch.manual_seed(0)
+        first = model.concept.router_weights(query, 1)
+        second = model.concept.router_weights(query, 1)
+        self._assert_one_hot(first)
+        assert not torch.equal(first, second)  # sampled, so it moves
+        model.eval()
+        # Eval must not sample: decoding and the nesting checks have to be
+        # reproducible.
+        a = model.concept.router_weights(query, 1)
+        b = model.concept.router_weights(query, 1)
+        assert torch.equal(a, b)
+        self._assert_one_hot(a)
+
+    def test_straight_through_gradient_reaches_the_router(self):
+        # The discrete modes are only usable if the estimator passes a gradient
+        # back through the arg-max, so every mode has to move the logits.
+        for mode in ("soft", "gumbel", "hard"):
+            model = self._model(
+                concept_router_mode=mode,
+                concept_router_gate_init=0.5,
+                concept_router_mem_gate_init=0.5,
+            )
+            model.train()
+            model(self.IDS, n_loops=2, kv_cache={}).sum().backward()
+            params = dict(model.named_parameters())
+            for name in (
+                "concept.router_proj.weight",
+                "concept.router_depth_bias",
+                "concept.router_gate",
+            ):
+                grad = params[name].grad
+                assert grad is not None and torch.count_nonzero(grad) > 0, (mode, name)
+
+    def test_only_soft_mode_trains_a_path_it_did_not_pick(self):
+        # Why "soft" is the default. A discrete choice multiplies an unpicked
+        # path by exactly zero, so the gradient reaches the logits but not the
+        # path's own parameters: a path behind a closed gate that the untrained
+        # router happens not to favour would never train at all. The soft
+        # mixture gives every path gradient every step, so it can bootstrap.
+        grads = {}
+        for mode in ("hard", "soft"):
+            model = self._model(
+                concept_router_mode=mode,
+                concept_router_gate_init=0.5,
+                concept_router_mem_gate_init=0.5,
+            )
+            with torch.no_grad():  # force every position onto "own"
+                model.concept.router_proj.weight.zero_()
+                model.concept.router_depth_bias.zero_()
+                model.concept.router_depth_bias[:, model.concept.router_paths.index("own")] = 1.0
+            model.train()
+            model(self.IDS, n_loops=2, kv_cache={}).sum().backward()
+            params = dict(model.named_parameters())
+            grads[mode] = (
+                int(torch.count_nonzero(params["concept.router_mem_gate"].grad)),
+                int(torch.count_nonzero(params["concept.router_proj.weight"].grad)),
+            )
+        assert grads["hard"][0] == 0 and grads["hard"][1] > 0
+        assert grads["soft"][0] > 0 and grads["soft"][1] > 0
+
+    def test_live_halt_mode_leaves_halted_positions_on_the_status_quo(self):
+        # A halted position contributes nothing to the block output through its
+        # own row, so "live" drops it back to its own concepts at full strength
+        # rather than to whatever the router would have picked. The default is
+        # "free", because a halted position's delta still changes its key and
+        # value rows and so it is still a concept SOURCE for live positions.
+        model = self._model(
+            concept_router_halt="live",
+            concept_router_gate_init=1.0,
+            concept_router_mem_gate_init=0.5,
+        )
+        fusion = model.concept
+        ctx, query = self._ctx_and_query(model, self.IDS)
+        halted = torch.zeros(1, self.IDS.shape[1], dtype=torch.bool)
+        halted[0, :4] = True
+        with torch.no_grad():
+            masked = fusion.delta("attn", query, **ctx, halted=halted)
+            free = fusion.delta("attn", query, **ctx)
+            fusion.router = "none"
+            status = fusion.delta("attn", query, **ctx)
+            fusion.router = "mix"
+        assert torch.equal(masked[:, :4], status[:, :4])
+        assert torch.equal(masked[:, 4:], free[:, 4:])
+        assert not torch.equal(free[:, :4], status[:, :4])
+
+    def test_free_halt_mode_ignores_the_mask(self):
+        model = self._model(
+            concept_router_gate_init=1.0, concept_router_mem_gate_init=0.5
+        )
+        assert model.concept.router_halt == "free"
+        ctx, query = self._ctx_and_query(model, self.IDS)
+        halted = torch.ones(1, self.IDS.shape[1], dtype=torch.bool)
+        with torch.no_grad():
+            a = model.concept.delta("attn", query, **ctx, halted=halted)
+            b = model.concept.delta("attn", query, **ctx)
+        assert torch.equal(a, b)
+
+    def test_router_touches_only_the_attn_site(self):
+        # "embed" and "e" are applied once per forward, so there is nothing
+        # per-iteration for a router to decide there and it must not fire.
+        model = self._model(
+            concept_sites=("e", "attn"),
+            concept_router_gate_init=1.0,
+            concept_router_mem_gate_init=0.5,
+        )
+        fusion = model.concept
+        ctx, query = self._ctx_and_query(model, self.IDS)
+        with torch.no_grad():
+            routed_e = fusion.delta("e", query, **ctx)
+            routed_attn = fusion.delta("attn", query, **ctx)
+            fusion.router = "none"
+            plain_e = fusion.delta("e", query, **ctx)
+            plain_attn = fusion.delta("attn", query, **ctx)
+        assert torch.equal(routed_e, plain_e)
+        assert not torch.equal(routed_attn, plain_attn)
+
+    def test_no_path_can_take_attention_from_another(self):
+        # The lesson of the retrieval experiment: each source keeps its own
+        # softmax, so the router mixes already-normalised path outputs rather
+        # than pooling heterogeneous slots into one competition. Opening the
+        # memory gate must leave the own-concept read bit-identical.
+        model = self._model(concept_router_gate_init=1.0)
+        fusion = model.concept
+        ctx, query = self._ctx_and_query(model, self.IDS)
+        with torch.no_grad():
+            shut = fusion.delta("attn", query, **ctx)
+            own_only = fusion._read_slots(
+                query, ctx["cand"], ctx["valid"], fusion.queries["attn"], fusion.key
+            )
+            fusion.router_mem_gate.fill_(0.5)
+            opened = fusion.delta("attn", query, **ctx)
+            own_again = fusion._read_slots(
+                query, ctx["cand"], ctx["valid"], fusion.queries["attn"], fusion.key
+            )
+        assert torch.equal(own_only, own_again)
+        assert not torch.equal(shut, opened)
+
+    def test_decode_steps_match_a_full_forward(self, monkeypatch):
+        # The memory path reads back over the whole sequence, so a decode step
+        # that only sees one token has to pick the concept memory up from the
+        # kv_cache. Each step is checked against a full forward of the running
+        # sequence, as TestConceptGenerate does for the cross combiner.
+        model = self._model(
+            [((10, 11), 1.0), ((11, 11), -0.5)],
+            concept_sites=("e", "attn"),
+            concept_router_gate_init=1.0,
+            concept_router_mem_gate_init=0.5,
+        )
+        prompt, forced, steps = torch.tensor([[1, 2, 10]]), 11, 3
+        calls = []
+        forward = model.forward
+
+        def spy(input_ids, **kwargs):
+            out = forward(input_ids, **kwargs)
+            calls.append(out.clone())
+            return out
+
+        monkeypatch.setattr(model, "forward", spy)
+        monkeypatch.setattr(
+            torch,
+            "multinomial",
+            lambda probs, num_samples: torch.full((probs.shape[0], num_samples), forced),
+        )
+        out = model.generate(prompt, max_new_tokens=steps, n_loops=2)
+        monkeypatch.undo()
+
+        assert out.tolist() == [prompt[0].tolist() + [forced] * steps]
+        with torch.no_grad():
+            for i, logits in enumerate(calls):
+                seen = out[:, : prompt.shape[1] + i]
+                full = model(seen, n_loops=2, kv_cache={})[:, -1]
+                assert torch.allclose(logits[:, -1], full, atol=1e-5), i
+
+    def test_router_is_causal(self):
+        # The leak guard on the new path. The "memory" action is the one way a
+        # router could reach backwards, so what it delivers over a shared
+        # prefix must not move when the suffix changes.
+        model = self._model(
+            concept_router_gate_init=1.0, concept_router_mem_gate_init=0.5
+        )
+        a = torch.tensor([[1, 10, 11, 2, 3, 4, 5, 6]])
+        b = torch.tensor([[1, 10, 11, 2, 97, 96, 95, 94]])
+        with torch.no_grad():
+            ctx_a, query = self._ctx_and_query(model, a)
+            ctx_b, _ = self._ctx_and_query(model, b)
+            for t in range(3):
+                delta_a = model.concept.delta("attn", query, **ctx_a, loop_t=t)
+                delta_b = model.concept.delta("attn", query, **ctx_b, loop_t=t)
+                assert torch.equal(delta_a[:, :4], delta_b[:, :4]), t
+                # ...and the tail really does differ, so this is not vacuous.
+                assert not torch.equal(delta_a, delta_b), t
+            assert torch.equal(model(a, n_loops=2)[:, :4], model(b, n_loops=2)[:, :4])
+
+    def test_needs_the_attn_site(self):
+        with pytest.raises(ValueError, match="attn"):
+            OpenMythos(
+                concept_cfg(
+                    concept_combiner="attend",
+                    concept_sites=("e",),
+                    concept_router="mix",
+                )
+            )
+
+    def test_needs_the_attend_combiner(self):
+        for combiner in ("mean", "cross"):
+            with pytest.raises(ValueError, match="attend"):
+                OpenMythos(
+                    concept_cfg(
+                        concept_combiner=combiner,
+                        concept_sites=("attn",),
+                        concept_router="mix",
+                    )
+                )
+
+    def test_the_walk_path_needs_the_walk(self):
+        with pytest.raises(ValueError, match="concept_walk"):
+            OpenMythos(
+                concept_cfg(
+                    concept_combiner="attend",
+                    concept_sites=("attn",),
+                    concept_router="mix",
+                    concept_router_paths=("none", "own", "walk"),
+                )
+            )
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            dict(concept_router="teleport"),
+            dict(concept_router="mix", concept_router_mode="telepathy"),
+            dict(concept_router="mix", concept_router_halt="sometimes"),
+            dict(concept_router="mix", concept_router_temp=0.0),
+            dict(concept_router="mix", concept_router_paths=("none", "nowhere")),
+            dict(concept_router="mix", concept_router_paths=("none",)),
+            dict(concept_router="mix", concept_router_paths=()),
+            dict(concept_router="mix", concept_router_paths=("own", "own")),
+        ],
+    )
+    def test_bad_router_config_is_rejected(self, overrides):
+        with pytest.raises(ValueError):
+            OpenMythos(
+                concept_cfg(
+                    concept_combiner="attend", concept_sites=("attn",), **overrides
+                )
+            )
+
+    def test_router_adds_no_buffers_to_state_dict(self):
+        model = self._model()
+        keys = model.state_dict().keys()
+        assert {k for k in keys if "concept.router" in k} == {
+            "concept.router_depth_bias",
+            "concept.router_gate",
+            "concept.router_mem_gate",
+            "concept.router_proj.weight",
+            "concept.router_mem_query.weight",
+            "concept.router_mem_key.weight",
+            "concept.router_mem_value.weight",
+        }
 
 
 if __name__ == "__main__":
