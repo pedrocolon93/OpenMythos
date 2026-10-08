@@ -71,6 +71,7 @@ import os
 import subprocess
 import sys
 import time
+from array import array
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
@@ -133,7 +134,10 @@ def prepare(args: argparse.Namespace) -> None:
     )
 
     budgets = {"train": args.train_tokens, "eval": args.eval_tokens}
-    bufs: dict[str, list[int]] = {"train": [], "eval": []}
+    # A Python list of ints costs about 30 bytes a token, so a billion of them
+    # would not fit in this box's RAM. array("i") holds each one in the 4 bytes
+    # it is saved as, which is the only reason a run at that scale is possible.
+    bufs: dict[str, array] = {"train": array("i"), "eval": array("i")}
     docs = {"train": 0, "eval": 0}
     current = "train"
     batch: list[str] = []
@@ -171,10 +175,22 @@ def prepare(args: argparse.Namespace) -> None:
 
     os.makedirs(args.cache_dir, exist_ok=True)
     out = os.path.join(args.cache_dir, "tokens.pt")
+    # frombuffer reads the array's own int32s, so the clone that gives the
+    # tensor its own storage is the single copy made. Each array is dropped as
+    # soon as it has been copied, so only one split is ever doubled in memory.
+    tensors = {}
+    for split in ("train", "eval"):
+        buf = bufs.pop(split)
+        tensors[split] = (
+            torch.frombuffer(buf, dtype=torch.int32).clone()
+            if len(buf)
+            else torch.empty(0, dtype=torch.int32)
+        )
+        del buf
     torch.save(
         {
-            "train": torch.tensor(bufs["train"], dtype=torch.int32),
-            "eval": torch.tensor(bufs["eval"], dtype=torch.int32),
+            "train": tensors["train"],
+            "eval": tensors["eval"],
             "meta": {
                 "dataset": args.dataset,
                 "dataset_config": args.dataset_config,
@@ -186,8 +202,8 @@ def prepare(args: argparse.Namespace) -> None:
         out,
     )
     print(
-        f"Wrote {out}: train {len(bufs['train']):,} tokens / {docs['train']:,} docs, "
-        f"eval {len(bufs['eval']):,} tokens / {docs['eval']:,} docs "
+        f"Wrote {out}: train {tensors['train'].numel():,} tokens / {docs['train']:,} docs, "
+        f"eval {tensors['eval'].numel():,} tokens / {docs['eval']:,} docs "
         f"in {time.perf_counter() - t0:.0f}s"
     )
     sys.stdout.flush()
