@@ -1258,6 +1258,14 @@ class ConceptFusion(nn.Module):
             torch.zeros(cfg.vocab_size, cfg.concept_dim, dtype=torch.float16),
             persistent=False,
         )
+        # Which rows of the table hold a vector at all. A static property of
+        # the loaded table, so every forward indexes it instead of reducing
+        # over concept_dim again.
+        self.register_buffer(
+            "token_has_vector",
+            torch.zeros(cfg.vocab_size, dtype=torch.bool),
+            persistent=False,
+        )
         self.register_buffer(
             "span_vectors",
             torch.zeros(0, cfg.concept_dim, dtype=torch.float16),
@@ -1274,15 +1282,12 @@ class ConceptFusion(nn.Module):
         # above, and loaded the same way: after construction, on every rank.
         # Registered whatever the config says, so a checkpoint's key set does
         # not depend on whether retrieval was on.
-        for name, dtype in (
-            ("node_vectors", torch.float16),
-            ("node_keys", torch.float16),
-        ):
-            self.register_buffer(name, torch.zeros(0, 0, dtype=dtype), persistent=False)
+        self.register_buffer(
+            "node_vectors", torch.zeros(0, 0, dtype=torch.float16), persistent=False
+        )
         for name, dtype in (
             ("neigh_ptr", torch.int64),
             ("neigh_idx", torch.int32),
-            ("neigh_rel", torch.int8),
             ("neigh_w", torch.float16),
             ("token_node", torch.int32),
             ("span_node", torch.int32),
@@ -1382,6 +1387,49 @@ class ConceptFusion(nn.Module):
 
     # -- loading ---------------------------------------------------------
 
+    def _check_payload_ids(
+        self,
+        payload: dict,
+        tokenizer_id: Optional[str],
+        what: str,
+        vocab_hint: str = "",
+    ) -> int:
+        """
+        Reject an artifact built against a different tokenizer or vocabulary.
+
+        A table or graph keyed by token id is meaningless under another
+        tokenizer, and the mismatch is silent at every later step, so both
+        loaders stop here rather than at a shape error much further on.
+
+        Args:
+            payload      -- the loaded dict, which may record "tokenizer_id"
+                            and "vocab_size"
+            tokenizer_id -- the caller's tokenizer name, or None to skip the
+                            check
+            what         -- the artifact's name, for the message
+            vocab_hint   -- appended to the vocab_size message
+
+        Returns:
+            The model's row count, which both callers need next.
+
+        Raises:
+            RuntimeError -- on a tokenizer_id or vocab_size mismatch
+        """
+        built_for = payload.get("tokenizer_id")
+        if tokenizer_id is not None and built_for is not None and tokenizer_id != built_for:
+            raise RuntimeError(
+                f"{what} was built for tokenizer {built_for!r}, but "
+                f"tokenizer_id={tokenizer_id!r} was given. Rebuild it against this tokenizer."
+            )
+        n_rows = self.concept_table.shape[0]
+        built_vocab = payload.get("vocab_size")
+        if built_vocab is not None and int(built_vocab) != n_rows:
+            raise RuntimeError(
+                f"{what} was built for vocab_size={int(built_vocab)}, but the "
+                f"model has {n_rows} rows.{vocab_hint}"
+            )
+        return n_rows
+
     def load(self, source, tokenizer_id: Optional[str] = None) -> dict:
         """
         Populate the lookup tables from a build artifact, a dict, or a tensor.
@@ -1414,19 +1462,12 @@ class ConceptFusion(nn.Module):
             loaded = torch.load(source, map_location="cpu")
             payload = loaded if isinstance(loaded, dict) else {"table": loaded}
 
-        n_rows = self.concept_table.shape[0]
-        built_for = payload.get("tokenizer_id")
-        if tokenizer_id is not None and built_for is not None and tokenizer_id != built_for:
-            raise RuntimeError(
-                f"Concept table was built for tokenizer {built_for!r}, but "
-                f"tokenizer_id={tokenizer_id!r} was given. Rebuild it against this tokenizer."
-            )
-        built_vocab = payload.get("vocab_size")
-        if built_vocab is not None and int(built_vocab) != n_rows:
-            raise RuntimeError(
-                f"Concept table was built for vocab_size={int(built_vocab)}, but the "
-                f"model has {n_rows} rows. Rebuild it against this tokenizer and vocab_size."
-            )
+        n_rows = self._check_payload_ids(
+            payload,
+            tokenizer_id,
+            "Concept table",
+            " Rebuild it against this tokenizer and vocab_size.",
+        )
 
         table = payload["table"]
         expected = (n_rows, self.concept_dim)
@@ -1437,9 +1478,10 @@ class ConceptFusion(nn.Module):
             )
         dev = self.concept_table.device
         self.concept_table.copy_(table.to(device=dev, dtype=self.concept_table.dtype))
+        self.token_has_vector = (self.concept_table != 0).any(-1)
 
         summary = {
-            "unigram_rows": int((self.concept_table != 0).any(dim=-1).sum()),
+            "unigram_rows": int(self.token_has_vector.sum()),
             "spans": {},
             "dropped_span_lengths": [],
         }
@@ -1504,19 +1546,7 @@ class ConceptFusion(nn.Module):
         """
         payload = source if isinstance(source, dict) else torch.load(source, map_location="cpu")
 
-        built_for = payload.get("tokenizer_id")
-        if tokenizer_id is not None and built_for is not None and tokenizer_id != built_for:
-            raise RuntimeError(
-                f"Concept graph was built for tokenizer {built_for!r}, but "
-                f"tokenizer_id={tokenizer_id!r} was given. Rebuild it against this tokenizer."
-            )
-        n_rows = self.concept_table.shape[0]
-        built_vocab = payload.get("vocab_size")
-        if built_vocab is not None and int(built_vocab) != n_rows:
-            raise RuntimeError(
-                f"Concept graph was built for vocab_size={int(built_vocab)}, but the "
-                f"model has {n_rows} rows."
-            )
+        n_rows = self._check_payload_ids(payload, tokenizer_id, "Concept graph")
         vectors = payload["node_vectors"]
         if vectors.shape[1] != self.concept_dim:
             raise RuntimeError(
@@ -1536,10 +1566,8 @@ class ConceptFusion(nn.Module):
 
         dev = self.concept_table.device
         self.node_vectors = vectors.to(device=dev, dtype=torch.float16)
-        self.node_keys = payload["node_keys"].to(device=dev, dtype=torch.float16)
         self.neigh_ptr = payload["neigh_ptr"].to(device=dev, dtype=torch.int64)
         self.neigh_idx = payload["neigh_idx"].to(device=dev, dtype=torch.int32)
-        self.neigh_rel = payload["neigh_rel"].to(device=dev, dtype=torch.int8)
         self.neigh_w = payload["neigh_w"].to(device=dev, dtype=torch.float16)
         self.token_node = token_node.to(device=dev, dtype=torch.int32)
         self.span_node = span_node.to(device=dev, dtype=torch.int32)
@@ -1610,9 +1638,8 @@ class ConceptFusion(nn.Module):
         if with_nodes:
             nodes = torch.full((B, L, K), -1, device=ctx.device, dtype=torch.int64)
 
-        uni = self.concept_table[ctx].float()
-        cand[:, :, 0] = uni
-        valid[:, :, 0] = (uni != 0).any(-1)
+        cand[:, :, 0] = self.concept_table[ctx].float()
+        valid[:, :, 0] = self.token_has_vector[ctx]
         if with_nodes:
             nodes[:, :, 0] = torch.where(
                 valid[:, :, 0], self.token_node[ctx].long(), torch.full_like(ctx, -1)
@@ -1721,7 +1748,62 @@ class ConceptFusion(nn.Module):
         cnt = valid.float().sum(-1, keepdim=True)
         return acc / cnt.clamp(min=1.0)
 
+    def context(
+        self,
+        input_ids: torch.Tensor,
+        context_ids: Optional[torch.Tensor] = None,
+    ) -> dict:
+        """
+        Every lookup one forward needs, gathered once for all sites.
+
+        The keys are delta()'s own parameter names, so a caller hands the dict
+        straight through as **kwargs. The memory and the walk are built only
+        when something asks for them, and stay None otherwise.
+
+        Args:
+            input_ids   -- (B, T) tokens whose positions need candidates
+            context_ids -- (B, L) the full sequence so far, when `input_ids` is
+                           only its tail
+
+        Returns:
+            {"cand", "valid", "memory", "mem_valid", "ret", "ret_valid"}. The
+            memory covers the NEW positions only; carrying it across decode
+            steps is the caller's business, since this class knows nothing
+            about caching.
+        """
+        walking = self.walk != "none"
+        cand, valid, nodes = self._candidates(input_ids, context_ids, with_nodes=walking)
+        memory = mem_valid = ret = ret_valid = None
+        if self.combiner == "cross" or self.router_memory:
+            memory, mem_valid = self.merge_mean(cand, valid), valid.any(-1)
+        if walking:
+            ret, ret_valid = self.expand(nodes)
+        return {
+            "cand": cand,
+            "valid": valid,
+            "memory": memory,
+            "mem_valid": mem_valid,
+            "ret": ret,
+            "ret_valid": ret_valid,
+        }
+
     # -- combining -------------------------------------------------------
+
+    def _gated(self, gate: torch.Tensor, feat: torch.Tensor) -> torch.Tensor:
+        """
+        Scale one pooled feature into model width and through its gate.
+
+        The cast is to the projection's own dtype: FSDP may have cast the
+        shared `proj` while the feature came out of fp32 arithmetic.
+
+        Args:
+            gate -- (dim,) the gate owning this term
+            feat -- (B, T, concept_dim) pooled concept feature
+
+        Returns:
+            (B, T, dim)
+        """
+        return gate * self.proj(feat.to(self.proj[0].weight.dtype))
 
     def _read_slots(
         self,
@@ -1877,7 +1959,7 @@ class ConceptFusion(nn.Module):
                 query, memory, mem_valid, self.queries[site], self.key, self.value
             )
 
-        own_term = self.gates[site] * self.proj(feat.to(self.proj[0].weight.dtype))
+        own_term = self._gated(self.gates[site], feat)
         out = own_term
 
         walk_term = None
@@ -1887,9 +1969,7 @@ class ConceptFusion(nn.Module):
             walked = self._read_slots(
                 query, ret, ret_valid, self.walk_queries[site], self.walk_key
             )
-            walk_term = self.walk_gates[site] * self.proj(
-                walked.to(self.proj[0].weight.dtype)
-            )
+            walk_term = self._gated(self.walk_gates[site], walked)
             out = out + walk_term
 
         if self.router == "none" or site != "attn":
@@ -1909,9 +1989,7 @@ class ConceptFusion(nn.Module):
                 self.router_mem_key,
                 self.router_mem_value,
             )
-            terms["memory"] = self.router_mem_gate * self.proj(
-                mem_feat.to(self.proj[0].weight.dtype)
-            )
+            terms["memory"] = self._gated(self.router_mem_gate, mem_feat)
 
         pi = self.router_weights(query, loop_t)
         routed = None
@@ -1948,25 +2026,10 @@ class ConceptFusion(nn.Module):
         memory can span the whole sequence and be cached across decode steps.
         """
         site = site or self.sites[0]
-        walking = self.walk != "none"
-        cand, valid, nodes = self._candidates(input_ids, context_ids, with_nodes=walking)
         if self.combiner != "mean" and query is None:
             raise ValueError(f"combiner {self.combiner!r} needs a query tensor")
-        memory = mem_valid = ret = ret_valid = None
-        if self.combiner == "cross" or self.router_memory:
-            memory, mem_valid = self.merge_mean(cand, valid), valid.any(-1)
-        if walking:
-            ret, ret_valid = self.expand(nodes)
         return self.delta(
-            site,
-            query,
-            cand,
-            valid,
-            memory,
-            mem_valid,
-            ret,
-            ret_valid,
-            loop_t=loop_t,
+            site, query, **self.context(input_ids, context_ids), loop_t=loop_t
         )
 
 
@@ -2089,23 +2152,9 @@ class OpenMythos(nn.Module):
         built for the "cross" combiner and for the path picker's "memory"
         action, and skipped entirely when neither asks for it.
         """
-        walking = self.concept.walk != "none"
-        cand, valid, nodes = self.concept._candidates(
-            input_ids, context_ids, with_nodes=walking
-        )
-        ctx = {
-            "cand": cand,
-            "valid": valid,
-            "memory": None,
-            "mem_valid": None,
-            "ret": None,
-            "ret_valid": None,
-        }
-        if walking:
-            ctx["ret"], ctx["ret_valid"] = self.concept.expand(nodes)
-        if self.concept.combiner == "cross" or self.concept.router_memory:
-            new_mem = self.concept.merge_mean(cand, valid)
-            new_valid = valid.any(-1)
+        ctx = self.concept.context(input_ids, context_ids)
+        if ctx["memory"] is not None:
+            new_mem, new_valid = ctx["memory"], ctx["mem_valid"]
             if kv_cache is not None and "concept_memory" in kv_cache:
                 prev = kv_cache["concept_memory"]
                 new_mem = torch.cat([prev["m"], new_mem], dim=1)

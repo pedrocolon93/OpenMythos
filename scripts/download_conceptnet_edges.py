@@ -36,12 +36,17 @@ import argparse
 import gzip
 import os
 import sys
-import urllib.parse
 import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from download_numberbatch import CHUNK, download  # noqa: E402
+from download_numberbatch import (  # noqa: E402
+    add_common_args,
+    check_gzip_magic,
+    dest_for,
+    download,
+    drain,
+)
 
 # ---------------------------------------------------------------------------
 # Source
@@ -83,17 +88,8 @@ def verify(path: str) -> int:
         The number of decompressed bytes read.
     """
     rerun = "re-run scripts/download_conceptnet_edges.py with --force"
+    check_gzip_magic(path, rerun)
 
-    try:
-        with open(path, "rb") as raw:
-            magic = raw.read(2)
-    except OSError as exc:
-        raise SystemExit(f"{path} is not readable: {exc}") from exc
-    if magic != b"\x1f\x8b":
-        raise SystemExit(f"{path} is not a gzip file (first bytes {magic!r}); {rerun}")
-
-    print(f"Verifying {path} (decompressing the whole archive)...", flush=True)
-    total = 0
     try:
         with gzip.open(path, "rb") as fh:
             line = fh.readline(8192)
@@ -117,12 +113,7 @@ def verify(path: str) -> int:
                 raise SystemExit(
                     f"Unexpected first row in {path!r}: endpoints {start!r} -> {end!r}; {rerun}"
                 )
-            total = len(line)
-            while True:
-                chunk = fh.read(CHUNK)
-                if not chunk:
-                    break
-                total += len(chunk)
+            total = len(line) + drain(fh)
     except (EOFError, OSError, zlib.error) as exc:
         raise SystemExit(f"{path} is truncated or corrupt ({exc}); {rerun}") from exc
 
@@ -137,15 +128,7 @@ def verify(path: str) -> int:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[1])
-    p.add_argument(
-        "--out-dir",
-        default="data/conceptnet",
-        help="directory to write the archive into",
-    )
-    p.add_argument("--url", default=None, help="override the source URL entirely")
-    p.add_argument(
-        "--force", action="store_true", help="re-download even if the file exists"
-    )
+    add_common_args(p, "data/conceptnet")
     return p.parse_args()
 
 
@@ -153,15 +136,7 @@ def main() -> None:
     args = parse_args()
 
     url = args.url or URL
-    # Name the file from the URL path only, so a query string or fragment never
-    # ends up in the filename.
-    name = os.path.basename(urllib.parse.urlparse(url).path)
-    if not name:
-        raise SystemExit(
-            f"Cannot derive a filename from {url!r}; pass a --url whose path ends "
-            "in a filename, e.g. .../conceptnet-assertions-5.7.0.csv.gz"
-        )
-    dest = os.path.join(args.out_dir, name)
+    dest = dest_for(url, args.out_dir, "conceptnet-assertions-5.7.0.csv.gz")
 
     # download() runs verify on both the fresh and the skip-if-exists path.
     download(url, dest, force=args.force, verify_fn=verify)

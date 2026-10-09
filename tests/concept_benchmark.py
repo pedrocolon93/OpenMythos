@@ -115,6 +115,35 @@ class TokenChunks(Dataset):
         return chunk[:-1], chunk[1:]
 
 
+def load_token_loaders(args: argparse.Namespace):
+    """
+    The cached tokens and the loaders every arm trains on.
+
+    tests/concept_trace.py trains on the same cache, so the data convention --
+    the gpt2 vocab size, the chunking and the shuffle order per --seed -- is
+    written once here rather than once per harness.
+
+    Returns:
+        (data, vocab_size, train_loader, eval_loader). The whole cached payload
+        comes back because both callers also record data["meta"].
+    """
+    data = torch.load(os.path.join(args.cache_dir, "tokens.pt"))
+    vocab_size = 50257 if args.tokenizer == "gpt2" else None
+    if vocab_size is None:
+        from transformers import AutoTokenizer
+
+        vocab_size = AutoTokenizer.from_pretrained(args.tokenizer).vocab_size
+
+    train_ds = TokenChunks(data["train"], args.seq_len)
+    eval_ds = TokenChunks(data["eval"], args.seq_len)
+    # A private generator, so batch order is a function of --seed alone and not
+    # of how much global RNG the model construction after this consumed.
+    g = torch.Generator().manual_seed(args.seed)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True, generator=g)
+    eval_loader = DataLoader(eval_ds, batch_size=args.batch_size, shuffle=False)
+    return data, vocab_size, train_loader, eval_loader
+
+
 def prepare(args: argparse.Namespace) -> None:
     """
     Stream documents, tokenize them, and cache disjoint train and eval tensors.
@@ -437,6 +466,19 @@ def delta_ratios(model, x: torch.Tensor) -> dict:
     }
 
 
+def gate_stats(gates) -> dict:
+    """
+    Per-site gate magnitudes, in the schema both harnesses write to disk.
+
+    Takes the gate dict rather than the model so the retrieval gates are
+    reported the same way as the injection gates.
+    """
+    return {
+        s: {"l2": g.detach().float().norm().item(), "mean_abs": g.detach().float().abs().mean().item()}
+        for s, g in gates.items()
+    }
+
+
 # ---------------------------------------------------------------------------
 # One run
 # ---------------------------------------------------------------------------
@@ -445,18 +487,7 @@ def delta_ratios(model, x: torch.Tensor) -> dict:
 def run(args: argparse.Namespace) -> None:
     torch.set_num_threads(args.threads)
     device = torch.device(args.device)
-    data = torch.load(os.path.join(args.cache_dir, "tokens.pt"))
-    vocab_size = 50257 if args.tokenizer == "gpt2" else None
-    if vocab_size is None:
-        from transformers import AutoTokenizer
-
-        vocab_size = AutoTokenizer.from_pretrained(args.tokenizer).vocab_size
-
-    train_ds = TokenChunks(data["train"], args.seq_len)
-    eval_ds = TokenChunks(data["eval"], args.seq_len)
-    g = torch.Generator().manual_seed(args.seed)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True, generator=g)
-    eval_loader = DataLoader(eval_ds, batch_size=args.batch_size, shuffle=False)
+    data, vocab_size, train_loader, eval_loader = load_token_loaders(args)
 
     model, cfg = build_model(args, vocab_size)
     model.to(device)
@@ -599,17 +630,10 @@ def run(args: argparse.Namespace) -> None:
         "torch": torch.__version__,
     }
     if args.variant != "baseline":
-        result["gates"] = {
-            s: {"l2": g.detach().float().norm().item(), "mean_abs": g.detach().float().abs().mean().item()}
-            for s, g in model.concept.gates.items()
-        }
+        result["gates"] = gate_stats(model.concept.gates)
         result["span_weight"] = model.concept.span_weight.detach().float().cpu().tolist()
         if args.walk != "none":
-            result["walk_gates"] = {
-                s: {"l2": g.detach().float().norm().item(),
-                    "mean_abs": g.detach().float().abs().mean().item()}
-                for s, g in model.concept.walk_gates.items()
-            }
+            result["walk_gates"] = gate_stats(model.concept.walk_gates)
         x0, _ = next(iter(eval_loader))
         result["delta_ratio"] = delta_ratios(model, x0.to(device))
 
@@ -924,7 +948,6 @@ def read_curves(results_dir: str) -> dict[str, dict]:
     import re
 
     step_re = re.compile(r"\] step +(\d+) +(train|eval) +([0-9.]+)")
-    final_re = re.compile(r"\] final eval ([0-9.]+)")
     runs: dict[str, dict] = {}
     logs = os.path.join(results_dir, "logs")
     names = {f[:-4] for f in os.listdir(logs) if f.endswith(".log")} if os.path.isdir(logs) else set()
@@ -1142,7 +1165,6 @@ def parse_args() -> argparse.Namespace:
         sp.add_argument("--dim", type=int, default=128)
         sp.add_argument("--lr", type=float, default=1e-3)
         sp.add_argument("--warmup", type=int, default=200)
-        sp.add_argument("--weight-decay", type=float, default=0.1)
         sp.add_argument("--eval-every", type=int, default=500)
         sp.add_argument("--eval-batches", type=int, default=20)
         sp.add_argument("--log-every", type=int, default=100)
@@ -1153,15 +1175,6 @@ def parse_args() -> argparse.Namespace:
             "every reported loss stay fp32. Changes numerics, so keep one setting across "
             "an experiment rather than mixing arms",
         )
-        sp.add_argument("--walk", choices=["none", "fixed"], default="none",
-                        help="retrieve concepts the text does not contain by walking the graph")
-        sp.add_argument("--graph", default="data/concept_graph_gpt2.pt",
-                        help="graph from scripts/build_concept_graph.py; only read when --walk is set")
-        sp.add_argument("--walk-k", type=int, default=4, help="retrieved concepts kept per position")
-        sp.add_argument("--walk-gate-init", type=float, default=0.0,
-                        help="starting value for the retrieval gates; 0 makes the arm start as "
-                        "exactly the model with --walk none")
-        sp.add_argument("--walk-fanout", type=int, default=4, help="neighbours considered per seed")
         sp.add_argument(
             "--gate-init",
             type=float,
@@ -1193,6 +1206,19 @@ def parse_args() -> argparse.Namespace:
     rp.add_argument("--seed", type=int, default=0)
     rp.add_argument("--name", default="")
     rp.add_argument("--tag", default="")
+    # These live on `run` and not in training() because sweep() does not forward
+    # them to its children. On the shared helper, `sweep --walk fixed` parsed and
+    # then ran every child with --walk none; here argparse rejects it instead.
+    rp.add_argument("--weight-decay", type=float, default=0.1)
+    rp.add_argument("--walk", choices=["none", "fixed"], default="none",
+                    help="retrieve concepts the text does not contain by walking the graph")
+    rp.add_argument("--graph", default="data/concept_graph_gpt2.pt",
+                    help="graph from scripts/build_concept_graph.py; only read when --walk is set")
+    rp.add_argument("--walk-k", type=int, default=4, help="retrieved concepts kept per position")
+    rp.add_argument("--walk-gate-init", type=float, default=0.0,
+                    help="starting value for the retrieval gates; 0 makes the arm start as "
+                    "exactly the model with --walk none")
+    rp.add_argument("--walk-fanout", type=int, default=4, help="neighbours considered per seed")
 
     sp = sub.add_parser("sweep", help="run the full grid, a few jobs at a time")
     common(sp)

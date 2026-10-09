@@ -753,6 +753,15 @@ def concept_model(entries=(), payload=None, **overrides):
     return open_gates(model)
 
 
+# The sequence the concept suites index into, and its leak-guard twin, which
+# shares the first four tokens and diverges after. Declared once because the
+# classes below all read the same index arithmetic off this one layout — SPAN_AB
+# ends at index 2, SPAN_BC and SPAN_ABC both end at index 3 — so editing one
+# copy of it used to desynchronise the others silently.
+CONCEPT_IDS = torch.tensor([[1, 10, 11, 2, 3, 4, 5, 6]])
+CONCEPT_IDS_DIVERGENT = torch.tensor([[1, 10, 11, 2, 97, 96, 95, 94]])
+
+
 class TestConceptInjection:
     """
     The concept vector is fused into one or more sites, all of which start
@@ -761,9 +770,9 @@ class TestConceptInjection:
     """
 
     @staticmethod
-    def _model_and_ids(table=None):
+    def _model_and_ids(table=None, **cfg_overrides):
         torch.manual_seed(0)
-        cfg = concept_cfg()
+        cfg = concept_cfg(**cfg_overrides)
         model = OpenMythos(cfg)
         model.eval()
         if table is None:
@@ -967,16 +976,11 @@ class TestConceptInjection:
         assert out.shape == (B, T + 3)
 
     def test_mla_variant_works(self):
-        torch.manual_seed(0)
-        cfg = mla_cfg(use_concept_injection=True, concept_dim=CONCEPT_DIM)
-        model = OpenMythos(cfg)
-        model.eval()
-        model.load_concept_table(torch.randn(cfg.vocab_size, CONCEPT_DIM))
+        model, ids = self._model_and_ids(attn_type="mla")
         open_gates(model)
-        ids = torch.randint(0, cfg.vocab_size, (B, T))
         with torch.no_grad():
             logits = model(ids, n_loops=2)
-        assert logits.shape == (B, T, cfg.vocab_size)
+        assert logits.shape == (B, T, model.cfg.vocab_size)
         assert torch.isfinite(logits).all()
 
 
@@ -990,7 +994,7 @@ class TestConceptSpans:
     SPAN_AB = (10, 11)       # ends at index 2 of IDS
     SPAN_BC = (11, 2)        # ends at index 3 of IDS
     SPAN_ABC = (10, 11, 2)   # also ends at index 3 of IDS
-    IDS = torch.tensor([[1, 10, 11, 2, 3, 4, 5, 6]])
+    IDS = CONCEPT_IDS
 
     def test_span_vector_lands_on_its_last_token(self):
         model = concept_model([(self.SPAN_AB, 1.0)], concept_max_span=3)
@@ -1157,8 +1161,8 @@ class TestConceptCausality:
     """
 
     PREFIX = 4
-    IDS_A = torch.tensor([[1, 10, 11, 2, 3, 4, 5, 6]])
-    IDS_B = torch.tensor([[1, 10, 11, 2, 97, 96, 95, 94]])
+    IDS_A = CONCEPT_IDS
+    IDS_B = CONCEPT_IDS_DIVERGENT
     ENTRIES = [((10, 11), 1.0), ((2, 3), 2.0), ((3, 4, 5), -1.0)]
 
     def test_candidates_ignore_future_tokens(self):
@@ -1183,38 +1187,35 @@ class TestConceptCausality:
         assert torch.equal(a[:, : self.PREFIX], b[:, : self.PREFIX])
         assert not torch.equal(a, b)
 
-    def test_mean_combiner_is_causal(self):
-        self._check(concept_combiner="mean")
-
-    def test_attend_combiner_is_causal(self):
-        self._check(concept_combiner="attend")
-
-    def test_cross_combiner_is_causal(self):
-        self._check(concept_combiner="cross")
-
-    def test_every_site_is_causal(self):
-        for site in ("embed", "e", "attn"):
-            self._check(concept_sites=(site,), concept_combiner="cross")
-
-    def test_all_sites_together_are_causal(self):
-        self._check(concept_sites=("embed", "e", "attn"), concept_combiner="cross")
-
-    def test_router_is_causal(self):
-        # The path picker, through the same guard. Its own "memory" path reads
-        # back over the sequence, so it is the one new way a later token could
-        # reach an earlier one; both router gates are opened at construction,
-        # since open_gates only moves the site gates.
-        self._check(
-            concept_sites=("attn",),
-            concept_combiner="attend",
-            concept_router="mix",
-            concept_router_gate_init=1.0,
-            concept_router_mem_gate_init=0.5,
-        )
+    # "cross" at the default site IS the ("e",) case, so it is not listed
+    # twice. The last case is the path picker, through the same guard: its own
+    # "memory" path reads back over the sequence, so it is the one new way a
+    # later token could reach an earlier one, and both router gates are opened
+    # at construction since open_gates only moves the site gates.
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            dict(concept_combiner="mean"),
+            dict(concept_combiner="attend"),
+            dict(concept_sites=("embed",), concept_combiner="cross"),
+            dict(concept_sites=("e",), concept_combiner="cross"),
+            dict(concept_sites=("attn",), concept_combiner="cross"),
+            dict(concept_sites=("embed", "e", "attn"), concept_combiner="cross"),
+            dict(
+                concept_sites=("attn",),
+                concept_combiner="attend",
+                concept_router="mix",
+                concept_router_gate_init=1.0,
+                concept_router_mem_gate_init=0.5,
+            ),
+        ],
+    )
+    def test_configuration_is_causal(self, overrides):
+        self._check(**overrides)
 
 
 class TestConceptCombiners:
-    IDS = torch.tensor([[1, 10, 11, 2, 3, 4, 5, 6]])
+    IDS = CONCEPT_IDS
     ENTRIES = [((10, 11), 1.0), ((11, 2), 0.5)]
 
     def test_zero_gate_identical_for_every_combiner(self):
@@ -1459,7 +1460,7 @@ class TestConceptGenerate:
 
 
 class TestConceptSites:
-    IDS = torch.tensor([[1, 10, 11, 2, 3, 4, 5, 6]])
+    IDS = CONCEPT_IDS
     ENTRIES = [((10, 11), 1.0)]
 
     @staticmethod
@@ -1644,21 +1645,18 @@ def graph_payload(vocab_size, n_span_rows, token_node, edges, n_nodes=6):
     the walk relies on, so a test that depends on the cap sees real behaviour.
     """
     ptr = [0]
-    idx, rel, weight = [], [], []
+    idx, weight = [], []
     for node in range(n_nodes):
         for nbr, w in sorted(edges.get(node, []), key=lambda e: -e[1]):
             idx.append(nbr)
-            rel.append(0)
             weight.append(w)
         ptr.append(len(idx))
     return {
         "node_vectors": torch.stack(
             [torch.full((CONCEPT_DIM,), float(i + 1)) for i in range(n_nodes)]
         ).to(torch.float16),
-        "node_keys": torch.zeros(n_nodes, 4, dtype=torch.float16),
         "neigh_ptr": torch.tensor(ptr, dtype=torch.int64),
         "neigh_idx": torch.tensor(idx, dtype=torch.int32),
-        "neigh_rel": torch.tensor(rel, dtype=torch.int8),
         "neigh_w": torch.tensor(weight, dtype=torch.float16),
         "token_node": torch.tensor(token_node, dtype=torch.int32),
         "span_node": torch.full((n_span_rows,), -1, dtype=torch.int32),
@@ -1830,7 +1828,7 @@ class TestConceptRouter:
     so no path can take attention mass away from another.
     """
 
-    IDS = torch.tensor([[1, 10, 11, 2, 3, 4, 5, 6]])
+    IDS = CONCEPT_IDS
     ENTRIES = [((10, 11), 1.0), ((2, 3), 2.0)]
 
     @staticmethod
@@ -1839,7 +1837,6 @@ class TestConceptRouter:
         overrides.setdefault("concept_sites", ("attn",))
         overrides.setdefault("concept_router", "mix")
         overrides.setdefault("concept_max_span", 3)
-        overrides.setdefault("concept_gate_init", 0.7)
         return concept_model(
             TestConceptRouter.ENTRIES if entries is None else entries, **overrides
         )
@@ -2281,8 +2278,8 @@ class TestConceptRouter:
         model = self._model(
             concept_router_gate_init=1.0, concept_router_mem_gate_init=0.5
         )
-        a = torch.tensor([[1, 10, 11, 2, 3, 4, 5, 6]])
-        b = torch.tensor([[1, 10, 11, 2, 97, 96, 95, 94]])
+        a = CONCEPT_IDS
+        b = CONCEPT_IDS_DIVERGENT
         with torch.no_grad():
             ctx_a, query = self._ctx_and_query(model, a)
             ctx_b, _ = self._ctx_and_query(model, b)

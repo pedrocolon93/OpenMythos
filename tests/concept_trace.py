@@ -13,10 +13,10 @@ Two paths.
           "attend", sites embed,e,attn, max_span 6) on the same FineWeb-Edu
           tokens the benchmark caches, and SAVES A CHECKPOINT -- which the
           benchmark harness deliberately does not. Config and data conventions
-          are the benchmark's: build_tiny_cfg from tests/small_benchmark.py,
-          then dataclasses.replace for the concept fields; TokenChunks,
-          load_payload, param_groups, lr_at and evaluate are imported from
-          tests/concept_benchmark.py rather than rewritten.
+          are the benchmark's, not reimplemented here: build_base_cfg,
+          load_token_loaders, load_payload, param_groups, lr_at, evaluate and
+          gate_stats are all imported from tests/concept_benchmark.py, and only
+          the concept fields are set in this file.
 
   trace   Loads that checkpoint, runs OpenMythos.generate on prompts chosen to
           exercise the channel, and records per position:
@@ -71,18 +71,19 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from open_mythos import OpenMythos  # noqa: E402
 from open_mythos.main import MythosConfig, ngram_keys  # noqa: E402
-from tests.small_benchmark import build_tiny_cfg, count_params, fmt_count  # noqa: E402
+from tests.small_benchmark import count_params, fmt_count  # noqa: E402
 from tests.concept_benchmark import (  # noqa: E402
-    TokenChunks,
+    build_base_cfg,
     evaluate,
+    gate_stats,
     load_payload,
+    load_token_loaders,
     lr_at,
     param_groups,
 )
@@ -108,17 +109,8 @@ PROMPTS = [
 
 def build_cfg(vocab_size: int, args: argparse.Namespace) -> MythosConfig:
     """The benchmark's base config, with the concept channel switched on."""
-    cfg = build_tiny_cfg(vocab_size, args.seq_len)
-    if args.dim != cfg.dim:
-        cfg = dataclasses.replace(
-            cfg,
-            dim=args.dim,
-            q_lora_rank=args.dim,
-            kv_lora_rank=args.dim // 2,
-            expert_dim=args.dim,
-        )
     return dataclasses.replace(
-        cfg,
+        build_base_cfg(vocab_size, args),
         use_concept_injection=True,
         concept_dim=300,
         concept_max_span=args.max_span,
@@ -145,16 +137,6 @@ def model_fingerprint() -> str:
         return hashlib.sha256(fh.read()).hexdigest()[:16]
 
 
-def gate_stats(model: OpenMythos) -> dict:
-    return {
-        s: {
-            "l2": g.detach().float().norm().item(),
-            "mean_abs": g.detach().float().abs().mean().item(),
-        }
-        for s, g in model.concept.gates.items()
-    }
-
-
 # ---------------------------------------------------------------------------
 # train
 # ---------------------------------------------------------------------------
@@ -163,20 +145,7 @@ def gate_stats(model: OpenMythos) -> dict:
 def train(args: argparse.Namespace) -> None:
     torch.set_num_threads(args.threads)
     device = torch.device(args.device)
-    data = torch.load(os.path.join(args.cache_dir, "tokens.pt"))
-    vocab_size = 50257 if args.tokenizer == "gpt2" else None
-    if vocab_size is None:
-        from transformers import AutoTokenizer
-
-        vocab_size = AutoTokenizer.from_pretrained(args.tokenizer).vocab_size
-
-    train_ds = TokenChunks(data["train"], args.seq_len)
-    eval_ds = TokenChunks(data["eval"], args.seq_len)
-    g = torch.Generator().manual_seed(args.seed)
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True, generator=g
-    )
-    eval_loader = DataLoader(eval_ds, batch_size=args.batch_size, shuffle=False)
+    data, vocab_size, train_loader, eval_loader = load_token_loaders(args)
 
     cfg = build_cfg(vocab_size, args)
     torch.manual_seed(args.seed)
@@ -241,7 +210,8 @@ def train(args: argparse.Namespace) -> None:
                 f"lr {lr_at(step, args):.2e}  {1 / rate:.2f}s/step  eta {eta / 60:.1f}min  "
                 f"gates "
                 + " ".join(
-                    f"{s}={v['l2']:.3f}" for s, v in sorted(gate_stats(model).items())
+                    f"{s}={v['l2']:.3f}"
+                    for s, v in sorted(gate_stats(model.concept.gates).items())
                 ),
                 flush=True,
             )
@@ -265,7 +235,7 @@ def train(args: argparse.Namespace) -> None:
         "train_curve": train_curve,
         "eval_curve": eval_curve,
         "final_eval": final,
-        "gates": gate_stats(model),
+        "gates": gate_stats(model.concept.gates),
         "span_weight": model.concept.span_weight.detach().float().cpu().tolist(),
         "params": n_params,
         "concept_params": concept_params,
@@ -473,7 +443,7 @@ def trace(args: argparse.Namespace) -> None:
     ckpt = torch.load(args.ckpt, map_location="cpu")
     cfg = MythosConfig(**ckpt["cfg"])
     model = OpenMythos(cfg)
-    missing, unexpected = model.load_state_dict(ckpt["state_dict"], strict=True)
+    model.load_state_dict(ckpt["state_dict"], strict=True)
     model.to(device).eval()
 
     # Vectors from --table (what the model trains and runs with); names from
@@ -501,7 +471,7 @@ def trace(args: argparse.Namespace) -> None:
     print(f"[trace] table {load_summary}", flush=True)
 
     fusion = model.concept
-    gates = gate_stats(model)
+    gates = gate_stats(model.concept.gates)
     sites = list(fusion.sites)
 
     # This instrument models one combiner: a softmax over the position's own
@@ -743,8 +713,6 @@ def trace(args: argparse.Namespace) -> None:
             },
             "load_summary": load_summary,
             "checks": checks,
-            "missing_keys": list(missing),
-            "unexpected_keys": list(unexpected),
         },
         "prompts": prompts_out,
     }

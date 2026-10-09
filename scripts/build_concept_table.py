@@ -113,6 +113,46 @@ def is_usable_term(term: str) -> bool:
     return any(unicodedata.category(ch).startswith("L") for ch in term)
 
 
+def iter_vector_lines(path: str):
+    """
+    Yield (dim, term_lang, term, values_text) for every term row in the file.
+
+    The gzip framing, the word2vec header and where a term ends are known in
+    one place, so the two passes below cannot drift on the file format or on
+    which rows they skip. The language filter deliberately stays with the
+    callers: read_terms counts the prefixed terms it drops across every
+    language in order to report an unusable --lang, which a filter in here
+    would hide.
+
+    Args:
+        path -- .txt.gz vector file
+
+    Raises:
+        SystemExit -- the header is not `<count> <dim>`, or the stream cannot
+                      be read to the end
+    """
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            header = fh.readline().split()
+            if len(header) != 2 or not header[1].isdigit():
+                raise SystemExit(f"Unexpected header in {path!r}: {header!r}")
+            dim = int(header[1])
+            for line in fh:
+                space = line.find(" ")
+                if space <= 0:
+                    continue
+                term_lang, term = strip_lang_prefix(line[:space])
+                yield dim, term_lang, term, line[space + 1 :]
+    except CORRUPT_FILE_ERRORS:
+        raise corrupt_file_exit(path) from None
+
+
+def parse_row(values_text: str, dim: int) -> torch.Tensor | None:
+    """The row's vector as float16, or None when it is not `dim` wide."""
+    values = [float(v) for v in values_text.split()]
+    return torch.tensor(values, dtype=torch.float16) if len(values) == dim else None
+
+
 def read_terms(path: str, lang: str) -> tuple[list[str], int]:
     """
     First pass: collect every term in the file, without parsing any vectors.
@@ -128,26 +168,18 @@ def read_terms(path: str, lang: str) -> tuple[list[str], int]:
     terms: list[str] = []
     prefixed = 0
     kept_prefixed = 0
-    try:
-        with gzip.open(path, "rt", encoding="utf-8") as fh:
-            header = fh.readline().split()
-            if len(header) != 2 or not header[1].isdigit():
-                raise SystemExit(f"Unexpected header in {path!r}: {header!r}")
-            dim = int(header[1])
-            for line in fh:
-                space = line.find(" ")
-                if space <= 0:
-                    continue
-                term_lang, term = strip_lang_prefix(line[:space])
-                if term_lang is not None:
-                    prefixed += 1
-                    if term_lang != lang:
-                        continue
-                    kept_prefixed += 1
-                if is_usable_term(term):
-                    terms.append(term)
-    except CORRUPT_FILE_ERRORS:
-        raise corrupt_file_exit(path) from None
+    # A file whose header promises rows but has none never enters the loop; 0
+    # then fails main's dim check instead of reporting a width nothing was read
+    # at.
+    dim = 0
+    for dim, term_lang, term, _ in iter_vector_lines(path):
+        if term_lang is not None:
+            prefixed += 1
+            if term_lang != lang:
+                continue
+            kept_prefixed += 1
+        if is_usable_term(term):
+            terms.append(term)
 
     if prefixed and not kept_prefixed:
         raise SystemExit(
@@ -421,57 +453,50 @@ def fill_vectors(
     unigram_collisions = 0
     span_collisions = 0
 
-    try:
-        with gzip.open(path, "rt", encoding="utf-8") as fh:
-            dim = int(fh.readline().split()[1])
-            for line in fh:
-                space = line.find(" ")
-                if space <= 0:
-                    continue
-                term_lang, term = strip_lang_prefix(line[:space])
-                if term_lang is not None and term_lang != lang:
-                    continue
-                ids = unigram_index.get(term)
-                seqs = span_seqs.get(term)
-                if not ids and not seqs:
-                    continue
+    # Only a file with no term rows at all leaves this at 0, and such a file
+    # produces no span vectors for the fallback below to shape.
+    dim = 0
+    for dim, term_lang, term, values_text in iter_vector_lines(path):
+        if term_lang is not None and term_lang != lang:
+            continue
+        ids = unigram_index.get(term)
+        seqs = span_seqs.get(term)
+        if not ids and not seqs:
+            continue
 
-                values = [float(v) for v in line[space + 1 :].split()]
-                if len(values) != dim:
+        row = parse_row(values_text, dim)
+        if row is None:
+            continue
+        matched += 1
+
+        if ids:
+            for tid in ids:
+                # First writer wins, same as spans below, so the result never
+                # depends on which duplicate came last.
+                if mask[tid]:
+                    unigram_collisions += 1
                     continue
-                row = torch.tensor(values, dtype=torch.float16)
-                matched += 1
+                table[tid] = row
+                mask[tid] = True
+                unigram_terms[tid] = term
 
-                if ids:
-                    for tid in ids:
-                        # First writer wins, same as spans below, so the
-                        # result never depends on which duplicate came last.
-                        if mask[tid]:
-                            unigram_collisions += 1
-                            continue
-                        table[tid] = row
-                        mask[tid] = True
-                        unigram_terms[tid] = term
-
-                if seqs:
-                    row_index = None
-                    for tup in seqs:
-                        # A tuple can be reachable from more than one term; the
-                        # first term to claim it wins, so matching stays a
-                        # function of the id sequence alone.
-                        if tup in seen_spans:
-                            span_collisions += 1
-                            continue
-                        if row_index is None:
-                            row_index = len(span_vectors)
-                            span_vectors.append(row)
-                            span_terms.append(term)
-                        seen_spans.add(tup)
-                        grams, rows = per_length[len(tup)]
-                        grams.append(tup)
-                        rows.append(row_index)
-    except CORRUPT_FILE_ERRORS:
-        raise corrupt_file_exit(path) from None
+        if seqs:
+            row_index = None
+            for tup in seqs:
+                # A tuple can be reachable from more than one term; the first
+                # term to claim it wins, so matching stays a function of the id
+                # sequence alone.
+                if tup in seen_spans:
+                    span_collisions += 1
+                    continue
+                if row_index is None:
+                    row_index = len(span_vectors)
+                    span_vectors.append(row)
+                    span_terms.append(term)
+                seen_spans.add(tup)
+                grams, rows = per_length[len(tup)]
+                grams.append(tup)
+                rows.append(row_index)
 
     stacked = (
         torch.stack(span_vectors)

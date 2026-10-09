@@ -169,6 +169,46 @@ def download(url: str, dest: str, force: bool = False, verify_fn=None) -> str:
     return dest
 
 
+def check_gzip_magic(path: str, rerun: str) -> None:
+    """
+    Fail before decompressing anything if `path` is not a gzip file at all.
+
+    The first two bytes catch the common failure: an HTML error page or a
+    redirect notice saved under a .gz name. Shared with
+    download_conceptnet_edges.py, which passes its own `rerun` hint so the
+    operator is told which script to re-run.
+
+    Args:
+        path  -- file to inspect
+        rerun -- command fragment appended to the failure message
+    """
+    try:
+        with open(path, "rb") as raw:
+            magic = raw.read(2)
+    except OSError as exc:
+        raise SystemExit(f"{path} is not readable: {exc}") from exc
+    if magic != b"\x1f\x8b":
+        raise SystemExit(f"{path} is not a gzip file (first bytes {magic!r}); {rerun}")
+
+    print(f"Verifying {path} (decompressing the whole archive)...", flush=True)
+
+
+def drain(fh) -> int:
+    """
+    Read `fh` to EOF in chunks and return how many bytes came out.
+
+    Reading to the end is the point -- a missing gzip trailer or a CRC
+    mismatch raises here rather than thousands of rows into a build.
+    """
+    total = 0
+    while True:
+        chunk = fh.read(CHUNK)
+        if not chunk:
+            break
+        total += len(chunk)
+    return total
+
+
 def verify(path: str) -> tuple[int, int]:
     """
     Check that `path` is a complete Numberbatch gzip archive.
@@ -194,16 +234,8 @@ def verify(path: str) -> tuple[int, int]:
         (term_count, dimensions)
     """
     rerun = "re-run scripts/download_numberbatch.py with --force"
+    check_gzip_magic(path, rerun)
 
-    try:
-        with open(path, "rb") as raw:
-            magic = raw.read(2)
-    except OSError as exc:
-        raise SystemExit(f"{path} is not readable: {exc}") from exc
-    if magic != b"\x1f\x8b":
-        raise SystemExit(f"{path} is not a gzip file (first bytes {magic!r}); {rerun}")
-
-    print(f"Verifying {path} (decompressing the whole archive)...", flush=True)
     try:
         with gzip.open(path, "rb") as fh:
             line = fh.readline(4096)
@@ -228,8 +260,7 @@ def verify(path: str) -> tuple[int, int]:
             if dim != EXPECTED_DIM:
                 raise SystemExit(f"Expected {EXPECTED_DIM}-dim vectors, header says {dim}")
 
-            while fh.read(CHUNK):
-                pass
+            drain(fh)
     except (EOFError, OSError, zlib.error) as exc:
         raise SystemExit(f"{path} is truncated or corrupt ({exc}); {rerun}") from exc
 
@@ -242,21 +273,50 @@ def verify(path: str) -> tuple[int, int]:
 # ---------------------------------------------------------------------------
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__.splitlines()[1])
+def dest_for(url: str, out_dir: str, example: str) -> str:
+    """
+    Destination path for `url`, named from its path component only.
+
+    Naming from the path alone keeps a query string or fragment in a --url
+    mirror out of the filename.
+
+    Args:
+        url     -- source URL
+        out_dir -- directory to write into
+        example -- filename quoted in the error when `url` has no path
+
+    Returns:
+        The path to write.
+    """
+    name = os.path.basename(urllib.parse.urlparse(url).path)
+    if not name:
+        raise SystemExit(
+            f"Cannot derive a filename from {url!r}; pass a --url whose path ends "
+            f"in a filename, e.g. .../{example}"
+        )
+    return os.path.join(out_dir, name)
+
+
+def add_common_args(p: argparse.ArgumentParser, out_dir: str) -> None:
+    """The options both download scripts take; only the --out-dir default differs."""
     p.add_argument(
         "--out-dir",
-        default="data/numberbatch",
+        default=out_dir,
         help="directory to write the archive into",
-    )
-    p.add_argument(
-        "--multilingual",
-        action="store_true",
-        help="fetch the full multilingual file (~9.1M terms) instead of English-only",
     )
     p.add_argument("--url", default=None, help="override the source URL entirely")
     p.add_argument(
         "--force", action="store_true", help="re-download even if the file exists"
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[1])
+    add_common_args(p, "data/numberbatch")
+    p.add_argument(
+        "--multilingual",
+        action="store_true",
+        help="fetch the full multilingual file (~9.1M terms) instead of English-only",
     )
     return p.parse_args()
 
@@ -265,15 +325,7 @@ def main() -> None:
     args = parse_args()
 
     url = args.url or (URL_MULTI if args.multilingual else URL_EN)
-    # Name the file from the URL path only, so a query string or fragment never
-    # ends up in the filename.
-    name = os.path.basename(urllib.parse.urlparse(url).path)
-    if not name:
-        raise SystemExit(
-            f"Cannot derive a filename from {url!r}; pass a --url whose path ends "
-            "in a filename, e.g. .../numberbatch-en-19.08.txt.gz"
-        )
-    dest = os.path.join(args.out_dir, name)
+    dest = dest_for(url, args.out_dir, "numberbatch-en-19.08.txt.gz")
 
     # download() verifies the archive on both the fresh and skip-if-exists paths.
     download(url, dest, force=args.force)

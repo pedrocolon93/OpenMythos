@@ -206,15 +206,11 @@ has nowhere to start. Rebuild an older table before running this.
 | `--max-degree` | `32` | Neighbours kept per node, strongest edges first. ConceptNet hubs have tens of thousands of edges, almost all weak. |
 | `--min-weight` | `1.0` | Drop edges below this weight. |
 | `--held-out` | `20000` | Probe edges removed from the adjacency entirely. |
-| `--key-dim` | `32` | Width of the per-node scoring keys. |
 
 Nodes are English terms that appear in the assertions *and* have a Numberbatch
 vector, so anything a walk reaches can also be injected. Edges are stored in
 both directions, the reverse carrying its own relation id, and each node's
 neighbours are sorted strongest-first so taking the top few needs no scoring.
-The output also carries a `--key-dim` projection of every node vector: a walk
-scores many more candidates than it keeps, and scoring narrow before gathering
-300 dimensions is what keeps per-position retrieval affordable.
 
 **Using it.**
 

@@ -42,7 +42,6 @@ from array import array
 import gzip
 import os
 import sys
-import zlib
 
 import torch
 
@@ -53,7 +52,8 @@ from build_concept_table import (  # noqa: E402
     CONCEPT_DIM,
     CORRUPT_FILE_ERRORS,
     is_usable_term,
-    strip_lang_prefix,
+    iter_vector_lines,
+    parse_row,
 )
 
 CONCEPTNET_VERSION = "5.7.0"
@@ -176,29 +176,15 @@ def read_vectors(path: str, wanted: set[str]) -> tuple[list[str], torch.Tensor]:
     """
     terms: list[str] = []
     rows: list[torch.Tensor] = []
-    try:
-        with gzip.open(path, "rt", encoding="utf-8") as fh:
-            header = fh.readline().split()
-            if len(header) != 2 or int(header[1]) != CONCEPT_DIM:
-                raise SystemExit(f"Unexpected header in {path!r}: {header!r}")
-            for line in fh:
-                space = line.find(" ")
-                if space <= 0:
-                    continue
-                lang, term = strip_lang_prefix(line[:space])
-                if lang is not None and lang != "en":
-                    continue
-                if term not in wanted:
-                    continue
-                values = [float(v) for v in line[space + 1 :].split()]
-                if len(values) != CONCEPT_DIM:
-                    continue
-                terms.append(term)
-                rows.append(torch.tensor(values, dtype=torch.float16))
-    except CORRUPT_FILE_ERRORS:
-        raise SystemExit(
-            f"{path} is truncated or corrupt; re-run scripts/download_numberbatch.py --force"
-        ) from None
+    for dim, lang, term, values_text in iter_vector_lines(path):
+        if dim != CONCEPT_DIM:
+            raise SystemExit(f"Expected {CONCEPT_DIM}-dim vectors, {path!r} says {dim}")
+        if (lang is not None and lang != "en") or term not in wanted:
+            continue
+        row = parse_row(values_text, CONCEPT_DIM)
+        if row is not None:
+            terms.append(term)
+            rows.append(row)
 
     stacked = (
         torch.stack(rows) if rows else torch.zeros(0, CONCEPT_DIM, dtype=torch.float16)
@@ -261,30 +247,6 @@ def cap_and_sort(
     }
 
 
-def low_rank_keys(vectors: torch.Tensor, width: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Project node vectors to a narrow key space used for scoring before gathering.
-
-    A walk scores many more candidates than it keeps. Scoring on 32 dimensions
-    and gathering the full 300 only for the winners is what keeps per-position,
-    per-iteration retrieval affordable, so the projection ships with the graph
-    rather than being recomputed per run.
-
-    Principal components of a random subsample, which keeps far more of the
-    inner-product structure than a random projection at the same width.
-
-    Returns:
-        (keys (N, width) float16, basis (CONCEPT_DIM, width) float32)
-    """
-    g = torch.Generator().manual_seed(PROBE_SEED)
-    n = vectors.shape[0]
-    sample = vectors[torch.randperm(n, generator=g)[: min(n, 100_000)]].float()
-    sample = sample - sample.mean(0, keepdim=True)
-    _, _, v = torch.pca_lowrank(sample, q=width, niter=4)
-    keys = (vectors.float() @ v).to(torch.float16)
-    return keys, v
-
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -314,7 +276,6 @@ def parse_args() -> argparse.Namespace:
         default=20_000,
         help="probe edges removed from the adjacency (0 keeps every edge)",
     )
-    p.add_argument("--key-dim", type=int, default=32, help="width of the scoring keys")
     return p.parse_args()
 
 
@@ -408,9 +369,6 @@ def main() -> None:
         f"isolated {int((degree == 0).sum()):,}"
     )
 
-    print(f"Projecting {args.key_dim}-d scoring keys")
-    node_keys, key_basis = low_rank_keys(node_vectors, args.key_dim)
-
     print(f"Mapping the concept table in {args.table} onto nodes")
     payload = torch.load(args.table, map_location="cpu", weights_only=False)
     for key in ("span_terms", "unigram_terms"):
@@ -434,8 +392,6 @@ def main() -> None:
     out = {
         "node_terms": node_terms,
         "node_vectors": node_vectors,
-        "node_keys": node_keys,
-        "key_basis": key_basis,
         **csr,
         "token_node": token_node,
         "span_node": span_node,
