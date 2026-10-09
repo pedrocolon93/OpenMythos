@@ -1,5 +1,6 @@
 from open_mythos.main import (
     ACTHalting,
+    ConceptFusion,
     Expert,
     GQAttention,
     LoRAAdapter,
@@ -37,6 +38,7 @@ __all__ = [
     "TransformerBlock",
     "LTIInjection",
     "ACTHalting",
+    "ConceptFusion",
     "RecurrentBlock",
     "OpenMythos",
     "precompute_rope_freqs",
