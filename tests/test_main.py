@@ -371,13 +371,82 @@ class TestMoEFFN:
         assert "router_bias" not in param_names
 
     def test_shared_experts_always_fire(self):
-        # Zero out all routed experts; output should still be nonzero from shared
-        for exp in self.moe.routed_experts:
-            for p in exp.parameters():
-                p.data.zero_()
+        # Zero out all routed experts; output should still be nonzero from shared.
+        # Iterating parameters() rather than the module list keeps this valid
+        # for both moe_dispatch settings: "batched" stores the experts as three
+        # stacked tensors, not as a ModuleList of Experts.
+        for p in self.moe.routed_experts.parameters():
+            p.data.zero_()
         x = torch.randn(B, T, self.cfg.dim)
         out = self.moe(x)
         assert out.abs().sum() > 0
+
+
+class TestMoEDispatch:
+    """The batched dispatch has to be the loop dispatch, only faster."""
+
+    @staticmethod
+    def _pair(**overrides):
+        """Build loop and batched MoEs holding identical weights."""
+        cfg_loop = gqa_cfg(moe_dispatch="loop", **overrides)
+        cfg_batched = gqa_cfg(moe_dispatch="batched", **overrides)
+        torch.manual_seed(1234)
+        loop = MoEFFN(cfg_loop)
+        torch.manual_seed(1234)
+        batched = MoEFFN(cfg_batched)
+        # The legacy-layout hook is what makes this a weight copy rather than
+        # a reshape by hand, and exercising it here is the point.
+        missing, unexpected = batched.load_state_dict(loop.state_dict(), strict=False)
+        assert not missing and not unexpected, (missing, unexpected)
+        return loop, batched
+
+    def test_rejects_unknown_dispatch(self):
+        with pytest.raises(ValueError, match="moe_dispatch"):
+            MoEFFN(gqa_cfg(moe_dispatch="grouped"))
+
+    def test_legacy_checkpoint_folds_into_stacked_layout(self):
+        loop, batched = self._pair()
+        # Every per-expert weight must be findable, transposed, in the stack.
+        for eid, expert in enumerate(loop.routed_experts):
+            for name in ("gate", "up", "down"):
+                stacked = getattr(batched.routed_experts, name)[eid]
+                assert torch.equal(stacked, getattr(expert, name).weight.t())
+
+    def test_matches_loop_dispatch(self):
+        loop, batched = self._pair()
+        x = torch.randn(B, T, 64, dtype=torch.float64)
+        a, b = loop.double()(x), batched.double()(x)
+        # Same sum of the same products, accumulated in a different order, so
+        # bit-equality is not available; a few epsilon is.
+        assert torch.allclose(a, b, rtol=1e-11, atol=1e-11), (a - b).abs().max()
+
+    def test_matches_loop_dispatch_in_gradients(self):
+        loop, batched = self._pair()
+        x = torch.randn(B, T, 64, dtype=torch.float64)
+        ga = torch.autograd.grad(
+            loop.double()(x).square().sum(), loop.router.weight
+        )[0]
+        gb = torch.autograd.grad(
+            batched.double()(x).square().sum(), batched.router.weight
+        )[0]
+        assert torch.allclose(ga, gb, rtol=1e-9, atol=1e-9), (ga - gb).abs().max()
+
+    def test_idle_experts_contribute_nothing(self):
+        # One token can reach at most n_experts_per_tok experts, so the rest
+        # are pure padding in the batched path. Their rows must not leak in.
+        loop, batched = self._pair(n_experts=8, n_experts_per_tok=2)
+        x = torch.randn(1, 1, 64, dtype=torch.float64)
+        assert torch.allclose(loop.double()(x), batched.double()(x),
+                              rtol=1e-11, atol=1e-11)
+
+    def test_batched_experts_are_initialized(self):
+        # _init_weights only reaches nn.Linear, so raw Parameters that were
+        # left at torch.empty() would be arbitrary memory, not N(0, 0.02).
+        moe = MoEFFN(gqa_cfg(moe_dispatch="batched"))
+        for name in ("gate", "up", "down"):
+            w = getattr(moe.routed_experts, name)
+            assert torch.isfinite(w).all()
+            assert 0.001 < w.std().item() < 0.2, w.std().item()
 
 
 # ---------------------------------------------------------------------------

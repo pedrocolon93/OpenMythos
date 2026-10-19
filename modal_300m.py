@@ -17,12 +17,13 @@ Run `survey` before deciding the hardware and `calibrate` before deciding the
 token budget. Neither is ceremony:
 
   * `survey` exists because this model's bottleneck is not known to be
-    arithmetic. The MoE dispatch is a Python loop over experts, and at 64
-    experts across 8 loop passes that is 512 mask operations per forward. The
-    sibling dim-768 run measured 9.8% MFU on a 4090 for exactly this reason.
-    A launch-overhead-bound model does not go faster on a bigger GPU, so the
-    tokens-per-dollar ranking can invert — and the only way to know is to
-    time it on each card.
+    arithmetic. The 9.8% MFU the sibling dim-768 run measured was traced to
+    the MoE dispatch loop and fixed (`moe_dispatch="batched"`, 11.7x end to
+    end on MPS; see docs/renting-a-gpu.md), but that fix has never been
+    measured on CUDA. If it carries over, the model is FLOP-bound and the
+    biggest card wins; if a different launch-overhead wall waits on CUDA, the
+    cheapest card with enough memory wins instead. Those predict opposite
+    orderings, and five minutes per card settles it.
   * `calibrate` exists because the token target sets the cosine schedule and
     so must be fixed before the run starts. Size it from a guessed MFU and
     the run either stops with its learning rate halfway down the cosine, or
@@ -66,11 +67,11 @@ HARDWARE = {
 #     A10       23.6h    5,200 tok/s   0.44B
 #
 # The H100 is 3.2x the arithmetic for 1.6x the price, so if this model is
-# FLOP-bound the H100 wins outright. If it is launch-overhead-bound — which
-# 9.8% MFU suggests, and which 512 Python-level expert mask operations per
-# forward would explain — then the extra arithmetic is unusable and the
-# cheapest card with enough memory wins instead. Those two hypotheses predict
-# opposite orderings, which is the whole reason `survey` exists.
+# FLOP-bound the H100 wins outright. If it is launch-overhead-bound the extra
+# arithmetic is unusable and the cheapest card with enough memory wins. The
+# dispatch fix should have moved it into the first camp — but that was measured
+# on MPS, not CUDA, so `survey` is what confirms which camp it is actually in.
+# The rows above were computed at the OLD 9.8% MFU and are now pessimistic.
 GPU = "A100-80GB"
 
 # What is actually available to spend. The Starter plan's monthly credit is
