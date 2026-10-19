@@ -6,6 +6,48 @@ from open_mythos.main import MythosConfig
 # expert_dim is solved from the residual budget after all other terms.
 
 
+def mythos_300m() -> MythosConfig:
+    """
+    300M parameter config. Budget pretraining target. dim=1024, 64 experts, 8 loop iters, 1k context.
+
+    Sized for a single 80GB GPU and a short wall clock rather than for a
+    parameter headline. Two choices differ in kind from the larger variants:
+
+    - `vocab_size` is 50257, the GPT-2 vocabulary, not the 201k of
+      `openai/gpt-oss-20b` that `MythosTokenizer` defaults to. Embeddings are
+      weight-tied, so a 201k vocabulary at dim=1024 would be 206M parameters —
+      two thirds of the whole budget spent on a lookup table. It also matches
+      the tokenizer the concept tables under `scripts/` are built against.
+    - `max_loop_iters` is 8 rather than 16. Recurrent depth multiplies the
+      per-token cost directly: at T=8 this config touches 394M parameter
+      equivalents per token, at T=16 it would touch 712M for the same 304M of
+      storage. Halving T nearly halves the tokens a fixed budget can buy.
+    """
+    return MythosConfig(
+        vocab_size=50257,
+        dim=1024,
+        n_heads=16,
+        n_kv_heads=4,
+        max_seq_len=1024,
+        max_loop_iters=8,
+        prelude_layers=2,
+        coda_layers=2,
+        attn_type="mla",
+        kv_lora_rank=128,
+        q_lora_rank=256,
+        qk_rope_head_dim=32,
+        qk_nope_head_dim=32,
+        v_head_dim=64,
+        n_experts=64,
+        n_shared_experts=2,
+        n_experts_per_tok=4,
+        expert_dim=1024,
+        act_threshold=0.99,
+        rope_theta=500000.0,
+        lora_rank=8,
+    )
+
+
 def mythos_1b() -> MythosConfig:
     """1B parameter config. Small research/fine-tuning model. dim=2048, 64 experts, 16 loop iters, 4k context."""
     return MythosConfig(

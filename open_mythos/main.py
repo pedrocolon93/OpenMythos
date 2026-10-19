@@ -42,6 +42,13 @@ class MythosConfig:
         n_shared_experts-- number of always-active shared experts
         n_experts_per_tok-- top-K experts selected per token by the router
         expert_dim      -- hidden dimension inside each fine-grained expert
+        moe_dispatch    -- how routed experts are evaluated: "batched" runs all
+                           of them in three batched matmuls, "loop" keeps the
+                           original Python loop over experts. Same mathematics,
+                           and at 64 experts the loop is ~5x slower and not
+                           bit-identical to the batched path (float addition is
+                           not associative, and the two accumulate in different
+                           orders). See MoEFFN for the measurements.
 
     Other:
         act_threshold   -- ACT halting threshold (cumulative probability to stop looping)
@@ -96,6 +103,9 @@ class MythosConfig:
     n_shared_experts: int = 2
     n_experts_per_tok: int = 4  # top-K routed
     expert_dim: int = 512  # fine-grained: dim // (n_experts // n_experts_per_tok)
+    # "batched" (default) dispatches every routed expert in three bmm calls;
+    # "loop" is the original per-expert Python loop. See MoEFFN.
+    moe_dispatch: str = "batched"
     # ACT halting
     act_threshold: float = 0.99
     # RoPE
@@ -556,6 +566,78 @@ class Expert(nn.Module):
         return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
+class BatchedExperts(nn.Module):
+    """
+    `n_experts` SwiGLU experts stored as three stacked weight tensors.
+
+    The same mathematics as `n_experts` separate `Expert` modules, laid out so
+    that all of them can run in one `torch.bmm` instead of one matmul each.
+    `Expert` keeps `nn.Linear` weights shaped (out, in); these are transposed
+    to (n_experts, in, out) so a batched matmul needs no transpose at call
+    time.
+
+    The parameters are raw `nn.Parameter`s rather than `nn.Linear`s, which has
+    one consequence worth stating: `OpenMythos._init_weights` only reaches
+    `nn.Linear` and `nn.Embedding`, so it would leave these at whatever
+    `torch.empty` returned. They are therefore initialized here, to the same
+    N(0, 0.02) that `_init_weights` would have applied.
+
+    A checkpoint written with the per-expert layout still loads: the pre-hook
+    folds `routed_experts.{i}.{gate,up,down}.weight` into the stacked tensors.
+    The reverse is not provided — a checkpoint saved from this layout cannot be
+    loaded by `moe_dispatch="loop"`.
+    """
+
+    def __init__(self, n_experts: int, dim: int, expert_dim: int):
+        """
+        Args:
+            n_experts  -- number of routed experts to store
+            dim        -- model width, the experts' input and output dimension
+            expert_dim -- inner SwiGLU dimension of each expert
+        """
+        super().__init__()
+        self.n_experts = n_experts
+        self.dim = dim
+        self.expert_dim = expert_dim
+        self.gate = nn.Parameter(torch.empty(n_experts, dim, expert_dim))
+        self.up = nn.Parameter(torch.empty(n_experts, dim, expert_dim))
+        self.down = nn.Parameter(torch.empty(n_experts, expert_dim, dim))
+        for param in (self.gate, self.up, self.down):
+            nn.init.normal_(param, std=0.02)
+        self._register_load_state_dict_pre_hook(self._fold_legacy_layout)
+
+    def _fold_legacy_layout(self, state_dict, prefix, *args) -> None:
+        """
+        Rewrite a per-expert state dict into the stacked layout, in place.
+
+        Runs before loading, so a checkpoint from before this class existed
+        resumes without conversion by hand. Does nothing when the state dict
+        is already stacked, or when it is missing per-expert keys — in the
+        latter case the normal missing-key machinery reports it, which is a
+        better error than anything raised from in here.
+
+        Args:
+            state_dict -- the dict being loaded, modified in place
+            prefix     -- this module's key prefix
+        """
+        if f"{prefix}gate" in state_dict:
+            return
+        legacy = [
+            f"{prefix}{i}.{name}.weight"
+            for i in range(self.n_experts)
+            for name in ("gate", "up", "down")
+        ]
+        if not all(key in state_dict for key in legacy):
+            return
+        for name in ("gate", "up", "down"):
+            rows = [
+                state_dict.pop(f"{prefix}{i}.{name}.weight")
+                for i in range(self.n_experts)
+            ]
+            # (out, in) per expert -> (n_experts, in, out)
+            state_dict[f"{prefix}{name}"] = torch.stack([r.t() for r in rows])
+
+
 class MoEFFN(nn.Module):
     """
     Fine-grained Mixture-of-Experts FFN (DeepSeekMoE, Dai et al., 2024).
@@ -587,8 +669,17 @@ class MoEFFN(nn.Module):
         # load-balancing bias adjusted externally during training; not a gradient param
         self.register_buffer("router_bias", torch.zeros(cfg.n_experts))
 
-        self.routed_experts = nn.ModuleList(
-            [Expert(cfg.dim, cfg.expert_dim) for _ in range(cfg.n_experts)]
+        self.dispatch = getattr(cfg, "moe_dispatch", "batched")
+        if self.dispatch not in ("batched", "loop"):
+            raise ValueError(
+                f"moe_dispatch must be 'batched' or 'loop', got {self.dispatch!r}"
+            )
+        self.routed_experts = (
+            BatchedExperts(cfg.n_experts, cfg.dim, cfg.expert_dim)
+            if self.dispatch == "batched"
+            else nn.ModuleList(
+                [Expert(cfg.dim, cfg.expert_dim) for _ in range(cfg.n_experts)]
+            )
         )
         self.shared_experts = nn.ModuleList(
             [
@@ -618,7 +709,52 @@ class MoEFFN(nn.Module):
         topk_scores = scores.gather(-1, topk_idx)
         topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True)  # renorm
 
-        # routed expert dispatch (token-level scatter)
+        if self.dispatch == "batched":
+            out = self._dispatch_batched(flat, topk_idx, topk_scores)
+        else:
+            out = self._dispatch_loop(flat, topk_idx, topk_scores)
+
+        # shared experts always fire for every token, so they are already one
+        # matmul over the full batch and need no dispatch
+        for shared in self.shared_experts:
+            out = out + shared(flat)
+
+        return out.view(B, T, D)
+
+    def _dispatch_loop(
+        self,
+        flat: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_scores: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        One masked matmul per (top-k slot, expert) pair. The original path.
+
+        Kept because it is the reference the batched path was checked against,
+        and because it reproduces the numerics of checkpoints trained before
+        the batched path existed. It is slow for reasons that are worth being
+        explicit about, since none of them is arithmetic:
+
+        - It runs `topk * n_experts` iterations — 256 for a 64-expert, top-4
+          config — and the recurrent block calls this once per loop iteration,
+          so a `max_loop_iters=16` forward pass executes 4,096 of them.
+        - `mask.any()` forces a device-to-host synchronization every iteration,
+          draining the pipeline before the next kernel can be queued.
+        - `flat[mask]` is boolean-mask indexing, which has to count the
+          selected rows on the host, so it synchronizes too.
+        - Each expert then sees only `n_tokens * topk / n_experts` rows, so the
+          three matmuls are far too small to saturate a GPU. Measured on MPS,
+          256 matmuls of (16x512)@(512x512) reach 249 GFLOP/s where the same
+          arithmetic as one matmul reaches 1,928.
+
+        Args:
+            flat        -- (n_tokens, dim) input rows
+            topk_idx    -- (n_tokens, topk) selected expert ids
+            topk_scores -- (n_tokens, topk) renormalized gating weights
+
+        Returns:
+            (n_tokens, dim) weighted sum of each token's selected experts.
+        """
         out = torch.zeros_like(flat)
         for i in range(self.topk):
             expert_ids = topk_idx[:, i]
@@ -628,12 +764,83 @@ class MoEFFN(nn.Module):
                 if not mask.any():
                     continue
                 out[mask] += token_scores[mask] * self.routed_experts[eid](flat[mask])
+        return out
 
-        # shared experts always fire for every token
-        for shared in self.shared_experts:
-            out = out + shared(flat)
+    def _dispatch_batched(
+        self,
+        flat: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_scores: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Every routed expert in three `bmm` calls, with no per-expert Python.
 
-        return out.view(B, T, D)
+        The shape mismatch to solve is that `bmm` wants one rectangular batch
+        while the experts receive different numbers of tokens. The fix is to
+        sort the `n_tokens * topk` assignments by expert — which makes each
+        expert's tokens contiguous — and then pad every expert's group out to
+        the largest group, so the ragged groups become one
+        (n_experts, capacity, dim) tensor.
+
+        Padding rows stay zero and are never read back: `slot` indexes only
+        the positions that were written, so the padded outputs are discarded
+        rather than masked. The cost of the padding is memory and wasted
+        arithmetic proportional to the routing imbalance, which is what the
+        `router_bias` load balancer exists to keep small. Capacity is the
+        largest observed group, never a fixed factor, so no token is ever
+        dropped — this is exact, not approximate.
+
+        One `int(counts.max())` synchronizes per call, replacing the loop
+        path's `topk * n_experts` of them.
+
+        Not bit-identical to `_dispatch_loop`: both compute the same sum of
+        the same products, but accumulate in different orders, and float
+        addition is not associative. Expect agreement to a few times the
+        dtype's epsilon, which `tests/test_main.py` asserts.
+
+        Args:
+            flat        -- (n_tokens, dim) input rows
+            topk_idx    -- (n_tokens, topk) selected expert ids
+            topk_scores -- (n_tokens, topk) renormalized gating weights
+
+        Returns:
+            (n_tokens, dim) weighted sum of each token's selected experts.
+        """
+        n_tokens, dim = flat.shape
+        n_experts = self.n_experts
+        device = flat.device
+
+        # Flatten (token, slot) pairs into one list of assignments. The top-k
+        # slots are merged here rather than looped over, which is what takes
+        # the iteration count from topk * n_experts down to none.
+        expert_of = topk_idx.reshape(-1)
+        score_of = topk_scores.reshape(-1)
+        token_of = torch.arange(n_tokens, device=device).repeat_interleave(self.topk)
+
+        order = torch.argsort(expert_of)
+        expert_sorted = expert_of[order]
+        token_sorted = token_of[order]
+        score_sorted = score_of[order]
+
+        counts = torch.bincount(expert_sorted, minlength=n_experts)
+        capacity = int(counts.max())
+        # Exclusive prefix sum: where each expert's group starts.
+        starts = torch.cumsum(counts, 0) - counts
+        rank = torch.arange(expert_sorted.numel(), device=device) - starts[expert_sorted]
+        slot = expert_sorted * capacity + rank
+
+        packed = flat.new_zeros(n_experts * capacity, dim)
+        packed = packed.index_copy(0, slot, flat[token_sorted])
+        packed = packed.view(n_experts, capacity, dim)
+
+        weights = self.routed_experts
+        hidden = F.silu(torch.bmm(packed, weights.gate)) * torch.bmm(packed, weights.up)
+        expert_out = torch.bmm(hidden, weights.down).reshape(n_experts * capacity, dim)
+
+        out = flat.new_zeros(n_tokens, dim)
+        return out.index_add(
+            0, token_sorted, expert_out[slot] * score_sorted.unsqueeze(-1)
+        )
 
 
 # ---------------------------------------------------------------------------

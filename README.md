@@ -174,6 +174,7 @@ Key design choices:
 |---|---|
 | [`docs/open_mythos.md`](docs/open_mythos.md) | Full API reference for the `OpenMythos` class — constructor, `forward`, `generate`, all sub-modules, configuration reference, and usage examples |
 | [`docs/datasets.md`](docs/datasets.md) | Recommended training datasets with token budget guidance per model size |
+| [`docs/renting-a-gpu.md`](docs/renting-a-gpu.md) | What a pretraining run costs on rented hardware — why the parameter count is the wrong denominator, measured MFU, provider rates, and the 300M budget run |
 
 ---
 
